@@ -1,5 +1,6 @@
+import * as Location from "expo-location";
 import { useRouter } from "expo-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   FlatList,
   SafeAreaView,
@@ -10,6 +11,8 @@ import {
   TextInput,
   View
 } from "react-native";
+import Weather from "../backend/weather";
+
 
 // Hard-coded test data
 const savedRoutes = [
@@ -17,42 +20,52 @@ const savedRoutes = [
   { id: '2', name: 'Marston Science Library' },
   { id: '3', name: 'Newell Hall' },
   { id: '4', name: 'Century Tower' },
-  { id: '5', name: 'O\'Connell Center' },
+  { id: '5', name: "O'Connell Center" },
   { id: '6', name: 'The Hub' },
-]; 
+];
+
 type routeItem = {
   id: string;
   name: string;
 };
 
-
 export default function Index() {
   const [searchQuery, setSearchQuery] = useState("");
+  const [coords, setCoords] = useState(null);
   const router = useRouter();
+
+  useEffect(() => {
+    (async () => {
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") return;
+      let loc = await Location.getCurrentPositionAsync({});
+      setCoords({ lat: loc.coords.latitude, lng: loc.coords.longitude });
+    })();
+  }, []);
+
   const handleSearch = () => {
-    if(!searchQuery.trim()){
-      return;
-    }
+    if (!searchQuery.trim()) return;
     router.push({
       pathname: "/search",
       params: { query: searchQuery }
-    })
+    });
   };
 
-  const renderRouteItem = ({ item }: { item: routeItem } ) => (
+  const renderRouteItem = ({ item }: { item: routeItem }) => (
     <View style={styles.gridItem}>
       <Text style={styles.gridItemText}>{item.name}</Text>
     </View>
   );
+
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.scrollContainer}>                
+      <ScrollView contentContainerStyle={styles.scrollContainer}>
         <View style={styles.card}>
           <Text style={styles.title}>Where are you going today?</Text>
-          
-          <TextInput 
+
+          <TextInput
             style={styles.searchBar}
-            placeholder="search" 
+            placeholder="search"
             placeholderTextColor="#999"
             value={searchQuery}
             onChangeText={setSearchQuery}
@@ -73,14 +86,17 @@ export default function Index() {
         </View>
 
         <View style={[styles.card, styles.weatherContainer]}>
-          <Text style={styles.sectionTitle}>upcoming weather</Text>
-          <View style={styles.horizontalList}>
-            <View style={styles.smallBox} />
-            <View style={styles.smallBox} />
-            <View style={styles.smallBox} />
-          </View>
+          <Text style={styles.sectionTitle}>Upcoming Weather</Text>
+          {coords ? (
+            <Weather
+              lat={coords.lat}
+              lng={coords.lng}
+              label="Current Location"
+            />
+          ) : (
+            <Text>Fetching location...</Text>
+          )}
         </View>
-
       </ScrollView>
     </SafeAreaView>
   );
@@ -142,8 +158,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#e0e0e0',
     borderRadius: 8,
   },
-  weatherContainer: {
-    backgroundColor: '#d9d9d9', 
+    weatherContainer: {
+    backgroundColor: 'rgba(124, 170, 255, 0.8)',
+    borderRadius: 18,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+    backdropFilter: 'blur(10px)', 
+    borderWidth: 1,
+    borderColor: 'rgba(100, 149, 237, 0.2)',
   },
   gridItem: {
     flex: 1,
