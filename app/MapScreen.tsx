@@ -44,7 +44,6 @@ export default function MapScreen() {
 
   // Fetch the polyline path between origin and destination
   const fetchRoute = async () => {
-    const GOOGLE_MAPS_APIKEY = "AIzaSyD9lU1bVMGBm77wCVZf6jKiFGe8FB6MlX8";
     try {
       const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${userLocation.latitude},${userLocation.longitude}&destination=${destination.latitude},${destination.longitude}&key=${GOOGLE_MAPS_APIKEY}`;
       const res = await fetch(url);
