@@ -3,6 +3,9 @@
 # dependencies
 node_modules/
 
+# private
+backend/firebase.js
+
 # Expo
 .expo/
 dist/
