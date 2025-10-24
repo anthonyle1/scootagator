@@ -14,7 +14,6 @@ import {
 import SearchInput from "./components/SearchInput";
 import Weather from "../backend/weather";
 
-const GOOGLE_MAPS_APIKEY = "AIzaSyBHlfWa9a9PVBdL2CBwXqYlJfJ9GcR6JzQ";
 
 const savedRoutes = [
   { id: "1", name: "Reitz Union" },
