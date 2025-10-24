@@ -1,19 +1,23 @@
-// IMPORTS
+// backend/weather.tsx
 import { useEffect, useState } from "react";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
 
-// WEATHER COMPONENT FUNCTION
-export default function Weather({ lat, lng }) {
-  const [locationLabel, setLocationLabel] = useState("Loading...");
-  const [hourlyForecast, setHourlyForecast] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+type WeatherProps = {
+  lat: number;
+  lng: number;
+  label?: string;
+};
 
-  // FETCH WEATHER DATA
+export default function Weather({ lat, lng, label }: WeatherProps) {
+  const [locationLabel, setLocationLabel] = useState("Loading...");
+  const [hourlyForecast, setHourlyForecast] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!lat || !lng) return;
 
-    let interval;
+    let interval: ReturnType<typeof setInterval> | null = null;
 
     async function fetchWeather() {
       setLoading(true);
@@ -24,7 +28,7 @@ export default function Weather({ lat, lng }) {
           "User-Agent": "ScootAGator/1.0 (kalischuchhardt@ufl.edu)",
         };
 
-        // Get location info
+        // Fetch metadata for the location
         const pointRes = await fetch(`https://api.weather.gov/points/${lat},${lng}`, { headers });
         const pointData = await pointRes.json();
 
@@ -32,30 +36,25 @@ export default function Weather({ lat, lng }) {
         const state = pointData.properties.relativeLocation?.properties.state;
         setLocationLabel(city && state ? `${city}, ${state}` : "Unknown Location");
 
+        // Fetch hourly forecast data
         const hourlyUrl = pointData.properties.forecastHourly;
         const hourlyRes = await fetch(hourlyUrl, { headers });
         const hourlyData = await hourlyRes.json();
 
-        // Keep only the next 24 hours
         const now = new Date();
-        const next24 = hourlyData.properties.periods.filter(
-          (hour) => new Date(hour.endTime) > now
-        ).slice(0, 24);
+        const next24 = hourlyData.properties.periods
+          .filter((hour: any) => new Date(hour.endTime) > now)
+          .slice(0, 24);
 
         setHourlyForecast(next24);
 
-        // UPDATE EVERY MINUTE
+        // Update every minute to remove expired hours
         interval = setInterval(() => {
           setHourlyForecast((prev) => {
-            const now = new Date();
-            const filtered = prev
-              .filter((hour) => new Date(hour.endTime) > now);
-
-            // Ensure we always have 24 hours (fetch more if needed)
-            return filtered;
+            const currentTime = new Date();
+            return prev.filter((hour) => new Date(hour.endTime) > currentTime);
           });
         }, 60000);
-
       } catch (err) {
         console.error(err);
         setError("Failed to fetch weather data");
@@ -66,16 +65,16 @@ export default function Weather({ lat, lng }) {
 
     fetchWeather();
 
-    return () => clearInterval(interval);
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [lat, lng]);
 
-  // CONDITIONAL RENDERING
   if (!lat || !lng) return <Text>Please select a location.</Text>;
   if (loading) return <Text>Loading weather data...</Text>;
   if (error) return <Text>{error}</Text>;
 
-  // FORMAT HOUR
-  const formatHour = (timeString) => {
+  const formatHour = (timeString: string) => {
     const date = new Date(timeString);
     let hours = date.getHours();
     const ampm = hours >= 12 ? "PM" : "AM";
@@ -83,8 +82,7 @@ export default function Weather({ lat, lng }) {
     return `${hours} ${ampm}`;
   };
 
-  // WEATHER EMOJIS
-  const getWeatherEmoji = (forecast) => {
+  const getWeatherEmoji = (forecast: string) => {
     forecast = forecast.toLowerCase();
     if (forecast.includes("sunny") || forecast.includes("clear")) return "🌞";
     if (forecast.includes("cloud")) return "☁️";
@@ -98,13 +96,15 @@ export default function Weather({ lat, lng }) {
     return "🌡️";
   };
 
-  // RENDER
   const now = new Date();
+
   return (
     <View style={styles.container}>
-      <Text style={styles.location}>{locationLabel}</Text>
+      {label && <Text style={styles.label}>{label}</Text>}
 
+      <Text style={styles.location}>{locationLabel}</Text>
       <Text style={styles.sectionTitle}>Hourly Forecast</Text>
+
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
@@ -118,10 +118,7 @@ export default function Weather({ lat, lng }) {
           return (
             <View
               key={hour.number}
-              style={[
-                styles.hourlyCard,
-                isCurrent && styles.currentHourCard
-              ]}
+              style={[styles.hourlyCard, isCurrent && styles.currentHourCard]}
             >
               <Text style={styles.hour}>{formatHour(hour.startTime)}</Text>
               <Text style={styles.emoji}>{getWeatherEmoji(hour.shortForecast)}</Text>
@@ -137,7 +134,6 @@ export default function Weather({ lat, lng }) {
   );
 }
 
-// STYLES
 const styles = StyleSheet.create({
   container: {
     backgroundColor: "rgba(255,255,255,0.85)",
@@ -148,6 +144,13 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 3 },
+  },
+  label: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#5B94FF",
+    textAlign: "center",
+    marginBottom: 4,
   },
   location: {
     fontSize: 18,
@@ -196,7 +199,7 @@ const styles = StyleSheet.create({
   temp: {
     fontSize: 16,
     fontWeight: "600",
-    color: 'rgba(91, 148, 255, 1)',
+    color: "rgba(91, 148, 255, 1)",
   },
   forecast: {
     fontSize: 12,
