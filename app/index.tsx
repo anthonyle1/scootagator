@@ -2,7 +2,6 @@ import * as Location from "expo-location";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -11,9 +10,10 @@ import {
   View,
   FlatList,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import SearchInput from "./components/SearchInput";
 import Weather from "../backend/weather";
-
+const GOOGLE_MAPS_APIKEY = process.env.GOOGLE_MAPS_APIKEY as string;
 
 const savedRoutes = [
   { id: "1", name: "Reitz Union" },
@@ -88,8 +88,12 @@ export default function Index() {
   );
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.scrollContainer}>
+  <SafeAreaView style={styles.safeArea}>
+    <FlatList
+      data={[]}
+      keyExtractor={() => "layout"}
+      contentContainerStyle={styles.scrollContainer}
+      ListHeaderComponent={
         <View style={styles.card}>
           <Text style={styles.title}>Where are you going today?</Text>
 
@@ -115,7 +119,8 @@ export default function Index() {
           <Text style={styles.sectionTitle}>Previous routes:</Text>
           <View style={styles.largeBox} />
         </View>
-
+      }
+      ListFooterComponent={
         <View style={[styles.card, styles.weatherContainer]}>
           <Text style={styles.sectionTitle}>Your Local Weather</Text>
           {coords ? (
@@ -124,13 +129,15 @@ export default function Index() {
             <Text>Fetching location...</Text>
           )}
         </View>
-      </ScrollView>
-    </SafeAreaView>
-  );
+      }
+    />
+  </SafeAreaView>
+);
+
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: "#333", paddingTop: StatusBar.currentHeight },
+  safeArea: { flex: 1, backgroundColor: "#333"},
   scrollContainer: { padding: 15 },
   card: { backgroundColor: "white", borderRadius: 12, padding: 20, marginBottom: 15 },
   title: { fontSize: 28, fontWeight: "bold", marginBottom: 20, color: "#111" },
