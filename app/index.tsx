@@ -13,7 +13,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import SearchInput from "./components/SearchInput";
 import Weather from "../backend/weather";
-const GOOGLE_MAPS_APIKEY = process.env.GOOGLE_MAPS_APIKEY as string;
+const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
+
 
 const savedRoutes = [
   { id: "1", name: "Reitz Union" },
