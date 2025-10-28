@@ -13,7 +13,7 @@ import {
 } from "react-native";
 import SearchInput from "./components/SearchInput";
 import Weather from "../backend/weather";
-
+const GOOGLE_MAPS_APIKEY = process.env.GOOGLE_MAPS_APIKEY as string;
 
 const savedRoutes = [
   { id: "1", name: "Reitz Union" },
