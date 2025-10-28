@@ -2,7 +2,6 @@ import * as Location from "expo-location";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -11,6 +10,7 @@ import {
   View,
   FlatList,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import SearchInput from "./components/SearchInput";
 import Weather from "../backend/weather";
 const GOOGLE_MAPS_APIKEY = process.env.GOOGLE_MAPS_APIKEY as string;
@@ -137,7 +137,7 @@ export default function Index() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: "#333", paddingTop: StatusBar.currentHeight },
+  safeArea: { flex: 1, backgroundColor: "#333"},
   scrollContainer: { padding: 15 },
   card: { backgroundColor: "white", borderRadius: 12, padding: 20, marginBottom: 15 },
   title: { fontSize: 28, fontWeight: "bold", marginBottom: 20, color: "#111" },
