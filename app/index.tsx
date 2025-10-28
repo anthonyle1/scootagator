@@ -88,8 +88,12 @@ export default function Index() {
   );
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.scrollContainer}>
+  <SafeAreaView style={styles.safeArea}>
+    <FlatList
+      data={[]}
+      keyExtractor={() => "layout"}
+      contentContainerStyle={styles.scrollContainer}
+      ListHeaderComponent={
         <View style={styles.card}>
           <Text style={styles.title}>Where are you going today?</Text>
 
@@ -115,7 +119,8 @@ export default function Index() {
           <Text style={styles.sectionTitle}>Previous routes:</Text>
           <View style={styles.largeBox} />
         </View>
-
+      }
+      ListFooterComponent={
         <View style={[styles.card, styles.weatherContainer]}>
           <Text style={styles.sectionTitle}>Your Local Weather</Text>
           {coords ? (
@@ -124,9 +129,11 @@ export default function Index() {
             <Text>Fetching location...</Text>
           )}
         </View>
-      </ScrollView>
-    </SafeAreaView>
-  );
+      }
+    />
+  </SafeAreaView>
+);
+
 }
 
 const styles = StyleSheet.create({
