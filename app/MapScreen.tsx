@@ -14,38 +14,23 @@ type RainViewerData = {
   radar: { past: { time: number }[]; nowcast: { time: number }[] };
 };
 
-// ---------- Helpers (hoisted) ----------
+// ---------- Helpers ----------
 function pad2(n: number) {
   return String(n).padStart(2, "0");
 }
 
 function decodePolyline(t: string): Coords[] {
   const out: Coords[] = [];
-  let index = 0,
-    lat = 0,
-    lng = 0;
+  let index = 0, lat = 0, lng = 0;
   while (index < t.length) {
-    let b,
-      shift = 0,
-      result = 0;
-    do {
-      b = t.charCodeAt(index++) - 63;
-      result |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
+    let b, shift = 0, result = 0;
+    do { b = t.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
     const dlat = (result & 1) ? ~(result >> 1) : result >> 1;
     lat += dlat;
-
-    shift = 0;
-    result = 0;
-    do {
-      b = t.charCodeAt(index++) - 63;
-      result |= (b & 0x1f) << shift;
-      shift += 5;
-    } while (b >= 0x20);
+    shift = 0; result = 0;
+    do { b = t.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
     const dlng = (result & 1) ? ~(result >> 1) : result >> 1;
     lng += dlng;
-
     out.push({ latitude: lat / 1e5, longitude: lng / 1e5 });
   }
   return out;
@@ -66,15 +51,23 @@ async function computeRoute(from: Coords, to: Coords): Promise<Coords[]> {
       routingPreference: "TRAFFIC_AWARE",
     }),
   });
-
   let json: any = null;
-  try {
-    json = await res.json();
-  } catch {
-    /* ignore */
-  }
+  try { json = await res.json(); } catch {}
   const encoded = json?.routes?.[0]?.polyline?.encodedPolyline;
   return encoded ? decodePolyline(encoded) : [];
+}
+
+// Binary search for closest frame index to a target timestamp (seconds)
+function closestFrameIndex(frames: number[], target: number) {
+  if (!frames.length) return -1;
+  let lo = 0, hi = frames.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  const a = lo;
+  const b = Math.max(0, lo - 1);
+  return Math.abs(frames[a] - target) < Math.abs(frames[b] - target) ? a : b;
 }
 
 // ========== Component ==========
@@ -101,10 +94,12 @@ export default function MapScreen() {
   const [radarEnabled, setRadarEnabled] = useState(true);
   const [radarOpacity, setRadarOpacity] = useState(0.6);
 
-  // Raw frame timestamps (UNIX seconds)
+  // Raw frame timestamps (sorted, seconds)
   const [frames, setFrames] = useState<number[]>([]);
-  // Index into the filtered timeline (±6h)
-  const [timelineIndex, setTimelineIndex] = useState(0);
+
+  const MIN_OFFSET = -120;
+  const MAX_OFFSET = 0;
+  const [sliderOffsetMin, setSliderOffsetMin] = useState(0); // 0 = now
 
   // Live clock
   const [now, setNow] = useState<Date>(new Date());
@@ -118,15 +113,10 @@ export default function MapScreen() {
     (async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") {
-          setLoading(false);
-          return;
-        }
+        if (status !== "granted") { setLoading(false); return; }
         const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
         setOrigin({ latitude: loc.coords.latitude, longitude: loc.coords.longitude });
-      } finally {
-        setLoading(false);
-      }
+      } finally { setLoading(false); }
     })();
   }, []);
 
@@ -146,18 +136,12 @@ export default function MapScreen() {
   // ====== ROUTE: debounced on origin/destination changes ======
   useEffect(() => {
     if (!origin || !destination || !GOOGLE_MAPS_APIKEY) return;
-
-    // capture current origin/destination to avoid stale refs in timeout
-    const o = origin;
-    const d = destination;
-
+    const o = origin, d = destination;
     if (routeFetchTimer.current) clearTimeout(routeFetchTimer.current);
     routeFetchTimer.current = setTimeout(async () => {
       try {
-        if (!o || !d) return;
         const pts = await computeRoute(o, d);
         setRouteCoords(pts);
-
         if (pts.length && mapRef.current) {
           mapRef.current.fitToCoordinates(pts, {
             edgePadding: { top: 60, bottom: 60, left: 40, right: 40 },
@@ -169,58 +153,51 @@ export default function MapScreen() {
             500
           );
         }
-      } catch {
-        /* ignore network hiccups */
-      }
+      } catch {}
     }, 600);
-
-    return () => {
-      if (routeFetchTimer.current) clearTimeout(routeFetchTimer.current);
-    };
+    return () => { if (routeFetchTimer.current) clearTimeout(routeFetchTimer.current); };
   }, [origin?.latitude, origin?.longitude, destination?.latitude, destination?.longitude]);
 
-  // ====== RAINVIEWER: fetch/refresh frames every 3 min; filter ±6h ======
+  // ====== RAINVIEWER: fetch/refresh frames every 3 min ======
   useEffect(() => {
     const fetchFrames = async () => {
       try {
         const res = await fetch("https://api.rainviewer.com/public/weather-maps.json");
         const json: RainViewerData = await res.json();
-        const list = [...(json.radar.past || []), ...(json.radar.nowcast || [])].map((f) => f.time);
-        const nowSec = Math.floor(Date.now() / 1000);
-        const sixHours = 6 * 3600;
-        const filtered = list.filter((t) => Math.abs(t - nowSec) <= sixHours).sort((a, b) => a - b);
-        if (!filtered.length) return;
-        setFrames(filtered);
-        setTimelineIndex((i) => Math.min(i, filtered.length - 1)); // keep within bounds
-      } catch {
-        /* ignore */
-      }
+        const list = [...(json.radar.past || []), ...(json.radar.nowcast || [])]
+          .map((f) => f.time)
+          .sort((a, b) => a - b);
+        if (!list.length) return;
+        setFrames(list);
+      } catch {}
     };
     fetchFrames();
     radarRefreshTimer.current = setInterval(fetchFrames, 3 * 60 * 1000);
     return () => radarRefreshTimer.current && clearInterval(radarRefreshTimer.current);
   }, []);
 
-  // Map slider index -> selected timestamp
-  const selectedTs = useMemo(
-    () => (frames.length ? frames[timelineIndex] : undefined),
-    [frames, timelineIndex]
-  );
+  // Slider (minutes offset) → closest available frame timestamp
+  const selectedTs = useMemo(() => {
+    if (!frames.length) return undefined;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const target = nowSec + sliderOffsetMin * 60; // sliderOffsetMin ≤ 0
+    const idx = closestFrameIndex(frames, target);
+    return idx >= 0 ? frames[idx] : undefined;
+  }, [frames, sliderOffsetMin]);
 
-  // Radar URL for selected frame
   const radarUrlTemplate =
     selectedTs !== undefined
       ? `https://tilecache.rainviewer.com/v2/radar/${selectedTs}/256/{z}/{x}/{y}/2/1_1.png`
       : undefined;
 
-  // Labels
+  // Labels for bottom UI
   const liveClock = `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
   const selectedDate = selectedTs ? new Date(selectedTs * 1000) : null;
   const frameLabel = selectedDate
     ? selectedDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "—";
   const deltaMin = selectedDate ? Math.round((selectedDate.getTime() - now.getTime()) / 60000) : 0;
-  const deltaLabel = deltaMin === 0 ? "now" : deltaMin > 0 ? `+${deltaMin} min` : `${deltaMin} min`;
+  const deltaLabel = deltaMin === 0 ? "now" : `${deltaMin} min`;
 
   if (loading || !destination) {
     return (
@@ -250,9 +227,9 @@ export default function MapScreen() {
         {radarEnabled && radarUrlTemplate && (
           <UrlTile
             urlTemplate={radarUrlTemplate}
-            zIndex={10}
+            zIndex={10}          // keep radar below route
             opacity={radarOpacity}
-            maximumZ={19}
+            maximumZ={12}        // ensures visibility at deep zoom
             tileSize={256}
           />
         )}
@@ -268,9 +245,8 @@ export default function MapScreen() {
         />
       </MapView>
 
-      {/* Bottom controls + slider */}
-      <View style={styles.bottomWrap}>
-        {/* Control bar */}
+      {/* Top: thinner controls (no time here) */}
+      <View style={styles.topWrap}>
         <View style={styles.controls}>
           <Pressable
             style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]}
@@ -281,7 +257,7 @@ export default function MapScreen() {
 
           <View style={styles.row}>
             <Pressable
-              style={[styles.smallBtn]}
+              style={styles.smallBtn}
               onPress={() => setRadarOpacity((o) => Math.max(0, +(o - 0.1).toFixed(2)))}
               disabled={!radarEnabled}
             >
@@ -289,40 +265,37 @@ export default function MapScreen() {
             </Pressable>
             <Text style={styles.opacityLabel}>{Math.round(radarOpacity * 100)}%</Text>
             <Pressable
-              style={[styles.smallBtn]}
+              style={styles.smallBtn}
               onPress={() => setRadarOpacity((o) => Math.min(1, +(o + 0.1).toFixed(2)))}
               disabled={!radarEnabled}
             >
               <Text style={styles.smallBtnText}>+</Text>
             </Pressable>
           </View>
-
-          <View style={styles.timeGroup}>
-            <Text style={styles.liveText}>● Live {liveClock}</Text>
-            <Text style={styles.subText}>
-              Frame: {frameLabel} ({deltaLabel})
-            </Text>
-          </View>
         </View>
+      </View>
 
-        {/* Timeline slider */}
+      {/* Bottom: past-only slider + times */}
+      <View style={styles.bottomWrap}>
         <View style={styles.sliderWrap}>
-          <Text style={styles.sliderLabel}>
-            {frames.length ? "Past 6h  ←  Time  →  +6h" : "Loading radar timeline…"}
-          </Text>
+          <Text style={styles.sliderLabel}>Past 2h  ←  Time  →  now</Text>
 
           <Slider
             style={styles.slider}
-            value={timelineIndex}
-            onValueChange={(n) => setTimelineIndex(Math.round(n as number))}
-            minimumValue={0}
-            maximumValue={Math.max(0, frames.length - 1)}
+            value={sliderOffsetMin}
+            onValueChange={(n: number) => setSliderOffsetMin(Math.round(n))}
+            minimumValue={MIN_OFFSET}
+            maximumValue={MAX_OFFSET}
             step={1}
-            disabled={!frames.length}
             minimumTrackTintColor="#007AFF"
             maximumTrackTintColor="#c7c7cc"
             thumbTintColor="#007AFF"
           />
+
+          <View style={styles.timebar}>
+            <Text style={styles.liveText}>● Live {liveClock}</Text>
+            <Text style={styles.subText}>Frame: {frameLabel} ({deltaLabel})</Text>
+          </View>
         </View>
       </View>
     </View>
@@ -335,62 +308,64 @@ const styles = StyleSheet.create({
   map: { flex: 1 },
   center: { justifyContent: "center", alignItems: "center" },
 
-  bottomWrap: {
+  // Thinner, screen-fitting top bar
+  topWrap: {
     position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 22,
-    paddingHorizontal: 16,
-    gap: 10,
+    top: 10,
+    left: 10,
+    right: 10,
   },
-
   controls: {
-    alignSelf: "center",
+    alignSelf: "stretch",
     backgroundColor: "rgba(255,255,255,0.95)",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderRadius: 10,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 6,
     shadowColor: "#000",
-    shadowOpacity: 0.15,
-    shadowRadius: 8,
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
     shadowOffset: { width: 0, height: 2 },
   },
-
   btn: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    minWidth: 100,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    minWidth: 88,
     alignItems: "center",
   },
   btnOn: { backgroundColor: "#00796b" },
   btnOff: { backgroundColor: "#9e9e9e" },
-  btnText: { color: "#fff", fontWeight: "700" },
+  btnText: { color: "#fff", fontWeight: "700", fontSize: 13 },
 
   row: { flexDirection: "row", alignItems: "center", gap: 6 },
   smallBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
+    width: 28,
+    height: 28,
+    borderRadius: 7,
     backgroundColor: "#607d8b",
     alignItems: "center",
     justifyContent: "center",
   },
-  smallBtnText: { color: "#fff", fontSize: 18, fontWeight: "800" },
-  opacityLabel: { minWidth: 44, textAlign: "center", fontWeight: "700", color: "#111" },
+  smallBtnText: { color: "#fff", fontSize: 16, fontWeight: "800" },
+  opacityLabel: { minWidth: 40, textAlign: "center", fontWeight: "700", color: "#111", fontSize: 12 },
 
-  timeGroup: { marginLeft: 8 },
-  liveText: { fontSize: 14, fontWeight: "700", color: "#1b5e20" },
-  subText: { fontSize: 12, color: "#333" },
-
+  bottomWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 18,
+    paddingHorizontal: 12,
+  },
   sliderWrap: {
     alignSelf: "stretch",
     backgroundColor: "rgba(255,255,255,0.95)",
     paddingHorizontal: 12,
-    paddingVertical: 12,
+    paddingVertical: 10,
     borderRadius: 12,
     shadowColor: "#000",
     shadowOpacity: 0.12,
@@ -399,12 +374,19 @@ const styles = StyleSheet.create({
   },
   sliderLabel: {
     textAlign: "center",
-    marginBottom: 8,
+    marginBottom: 6,
     color: "#111",
     fontWeight: "600",
+    fontSize: 13,
   },
-  slider: {
-    width: "100%",
-    height: 32,
+  slider: { width: "100%", height: 30 },
+
+  timebar: {
+    marginTop: 6,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "baseline",
   },
+  liveText: { fontSize: 12, fontWeight: "700", color: "#1b5e20" },
+  subText: { fontSize: 11, color: "#333" },
 });
