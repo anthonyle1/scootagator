@@ -1,23 +1,28 @@
 // app/MapScreen.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, StyleSheet, Platform, Pressable } from "react-native";
-import MapView, { Marker, Polyline, LatLng, Region, UrlTile } from "react-native-maps";
+import { View, Text, StyleSheet, Platform, Pressable, Image, ActivityIndicator } from "react-native";
+import MapView, { Marker, Polyline, LatLng, Region, UrlTile, PROVIDER_GOOGLE } from "react-native-maps";
 import { useLocalSearchParams } from "expo-router";
 import * as Location from "expo-location";
 import Slider from "@react-native-community/slider";
 
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
 
-// ---------- Types ----------
 type Coords = LatLng;
-type RainViewerData = {
-  radar: { past: { time: number }[]; nowcast: { time: number }[] };
-};
 
-// ---------- Helpers ----------
-function pad2(n: number) {
-  return String(n).padStart(2, "0");
-}
+/** ===== Tunables ===== */
+const MAX_NATIVE_Z = 12;             // RainViewer native max zoom
+const MAP_MAX_Z = 22;                // allow deep zoom; tiles upscale
+const TILE_SIZE_IOS = 256;           // iOS: safer with 256
+const TILE_SIZE_ANDROID = 512;       // Android: crisp with 512
+const NEIGHBOR_RADIUS = 1;           // 3x3 neighborhood
+const PREFETCH_Z_SPREAD = [0, -1];   // prefetch zClamp and zClamp-1
+const CONCURRENCY = 6;               // prefetch pool size
+const PREFETCH_DEBOUNCE_MS = 150;    // debounce region/frame prefetch
+const MAX_FRAMES_TO_CACHE = 18;      // ~last 2h at ~6-10min cadence
+
+/** ===== Helpers ===== */
+function pad2(n: number) { return String(n).padStart(2, "0"); }
 
 function decodePolyline(t: string): Coords[] {
   const out: Coords[] = [];
@@ -25,12 +30,10 @@ function decodePolyline(t: string): Coords[] {
   while (index < t.length) {
     let b, shift = 0, result = 0;
     do { b = t.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
-    const dlat = (result & 1) ? ~(result >> 1) : result >> 1;
-    lat += dlat;
+    const dlat = (result & 1) ? ~(result >> 1) : result >> 1; lat += dlat;
     shift = 0; result = 0;
     do { b = t.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
-    const dlng = (result & 1) ? ~(result >> 1) : result >> 1;
-    lng += dlng;
+    const dlng = (result & 1) ? ~(result >> 1) : result >> 1; lng += dlng;
     out.push({ latitude: lat / 1e5, longitude: lng / 1e5 });
   }
   return out;
@@ -51,64 +54,95 @@ async function computeRoute(from: Coords, to: Coords): Promise<Coords[]> {
       routingPreference: "TRAFFIC_AWARE",
     }),
   });
-  let json: any = null;
-  try { json = await res.json(); } catch {}
+  let json: any = null; try { json = await res.json(); } catch {}
   const encoded = json?.routes?.[0]?.polyline?.encodedPolyline;
   return encoded ? decodePolyline(encoded) : [];
 }
 
-// Binary search for closest frame index to a target timestamp (seconds)
 function closestFrameIndex(frames: number[], target: number) {
   if (!frames.length) return -1;
   let lo = 0, hi = frames.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (frames[mid] < target) lo = mid + 1; else hi = mid;
-  }
-  const a = lo;
-  const b = Math.max(0, lo - 1);
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (frames[mid] < target) lo = mid + 1; else hi = mid; }
+  const a = lo, b = Math.max(0, lo - 1);
   return Math.abs(frames[a] - target) < Math.abs(frames[b] - target) ? a : b;
 }
 
-// ========== Component ==========
+function regionToZoom(r: Region) { return Math.max(0, Math.log2(360 / r.longitudeDelta)); }
+function lngLatToTile(lon: number, lat: number, z: number) {
+  const n = Math.pow(2, z);
+  const x = Math.floor(((lon + 180) / 360) * n);
+  const latRad = (lat * Math.PI) / 180;
+  const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+  return { x, y, z };
+}
+function tileUrl(ts: number, z: number, x: number, y: number, size = 256) {
+  return `https://tilecache.rainviewer.com/v2/radar/${ts}/${size}/${z}/${x}/${y}/2/1_1.png`;
+}
+
+/** ===== Simple tile cache + concurrency-limited prefetch queue ===== */
+const tileCache = new Set<string>();
+async function prefetchUrlOnce(url: string) {
+  if (tileCache.has(url)) return true;
+  const ok = await Image.prefetch(url).catch(() => false);
+  if (ok) tileCache.add(url);
+  return ok;
+}
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency = CONCURRENCY) {
+  let i = 0;
+  const results: Promise<T>[] = [];
+  const workers = new Array(Math.min(concurrency, tasks.length)).fill(0).map(async () => {
+    while (i < tasks.length) {
+      const idx = i++;
+      results[idx] = tasks[idx]();
+      await results[idx].catch(() => undefined);
+    }
+  });
+  await Promise.all(workers);
+  return Promise.allSettled(results);
+}
+
+/** ===== Component ===== */
 export default function MapScreen() {
   const mapRef = useRef<MapView>(null);
   const routeFetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const radarRefreshTimer = useRef<NodeJS.Timeout | null>(null);
+  const radarRefreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const prefetchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const { destLat, destLng, destName } = useLocalSearchParams();
 
-  // Destination from params
   const [destination] = useState<Coords | null>(() => {
-    const lat = Number(destLat);
-    const lng = Number(destLng);
+    const lat = Number(destLat), lng = Number(destLng);
     return Number.isFinite(lat) && Number.isFinite(lng) ? { latitude: lat, longitude: lng } : null;
   });
 
-  // User location + route polyline
   const [origin, setOrigin] = useState<Coords | null>(null);
   const [routeCoords, setRouteCoords] = useState<Coords[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // ---- Radar state ----
+  // radar states
   const [radarEnabled, setRadarEnabled] = useState(true);
   const [radarOpacity, setRadarOpacity] = useState(0.6);
 
-  // Raw frame timestamps (sorted, seconds)
+  // frames + indexing
   const [frames, setFrames] = useState<number[]>([]);
+  const [frameIdx, setFrameIdx] = useState(0);
+  const [pendingIdx, setPendingIdx] = useState<number | null>(null); // for smooth slider UX
 
-  const MIN_OFFSET = -120;
-  const MAX_OFFSET = 0;
-  const [sliderOffsetMin, setSliderOffsetMin] = useState(0); // 0 = now
+  // timestamps
+  const [activeTs, setActiveTs] = useState<number | undefined>(undefined);
+  const [desiredTs, setDesiredTs] = useState<number | undefined>(undefined);
 
-  // Live clock
+  // region (for prefetch + clamp)
+  const [region, setRegion] = useState<Region | null>(null);
+
+  // loading state
+  const [isLoadingFrame, setIsLoadingFrame] = useState(false);
+
+  // clock
   const [now, setNow] = useState<Date>(new Date());
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(t); }, []);
 
-  // ====== LOCATION: initial + live watch ======
+  // location: initial + watch
   useEffect(() => {
     (async () => {
       try {
@@ -119,7 +153,6 @@ export default function MapScreen() {
       } finally { setLoading(false); }
     })();
   }, []);
-
   useEffect(() => {
     let sub: Location.LocationSubscription | undefined;
     (async () => {
@@ -130,81 +163,157 @@ export default function MapScreen() {
         (loc) => setOrigin({ latitude: loc.coords.latitude, longitude: loc.coords.longitude })
       );
     })();
-    return () => sub?.remove();
+    return () => { sub?.remove(); };
   }, []);
 
-  // ====== ROUTE: debounced on origin/destination changes ======
+  // route compute (debounced)
   useEffect(() => {
     if (!origin || !destination || !GOOGLE_MAPS_APIKEY) return;
+    if (routeFetchTimer.current) { clearTimeout(routeFetchTimer.current); routeFetchTimer.current = null; }
     const o = origin, d = destination;
-    if (routeFetchTimer.current) clearTimeout(routeFetchTimer.current);
+
     routeFetchTimer.current = setTimeout(async () => {
       try {
         const pts = await computeRoute(o, d);
         setRouteCoords(pts);
+        const initialRegion: Region = { latitude: o.latitude, longitude: o.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 };
         if (pts.length && mapRef.current) {
-          mapRef.current.fitToCoordinates(pts, {
-            edgePadding: { top: 60, bottom: 60, left: 40, right: 40 },
-            animated: true,
-          });
-        } else if (mapRef.current && o) {
-          mapRef.current.animateToRegion(
-            { latitude: o.latitude, longitude: o.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 },
-            500
-          );
+          mapRef.current.fitToCoordinates(pts, { edgePadding: { top: 60, bottom: 60, left: 40, right: 40 }, animated: true });
+        } else if (mapRef.current) {
+          mapRef.current.animateToRegion(initialRegion, 500);
         }
+        setRegion((r) => r ?? initialRegion);
       } catch {}
     }, 600);
-    return () => { if (routeFetchTimer.current) clearTimeout(routeFetchTimer.current); };
+
+    return () => { if (routeFetchTimer.current) { clearTimeout(routeFetchTimer.current); routeFetchTimer.current = null; } };
   }, [origin?.latitude, origin?.longitude, destination?.latitude, destination?.longitude]);
 
-  // ====== RAINVIEWER: fetch/refresh frames every 3 min ======
+  // frames fetch/refresh
   useEffect(() => {
     const fetchFrames = async () => {
       try {
         const res = await fetch("https://api.rainviewer.com/public/weather-maps.json");
-        const json: RainViewerData = await res.json();
-        const list = [...(json.radar.past || []), ...(json.radar.nowcast || [])]
-          .map((f) => f.time)
+        if (!res.ok) return;
+        const json: any = await res.json().catch(() => null);
+        const past = Array.isArray(json?.radar?.past) ? json.radar.past : [];
+        const nowcast = Array.isArray(json?.radar?.nowcast) ? json.radar.nowcast : [];
+        const merged = [...past, ...nowcast]
+          .map((f) => Number((f as any)?.time))
+          .filter((n) => Number.isFinite(n))
           .sort((a, b) => a - b);
-        if (!list.length) return;
-        setFrames(list);
+        if (!merged.length) return;
+        setFrames(merged);
+
+        if (activeTs === undefined) {
+          const nowSec = Math.floor(Date.now() / 1000);
+          const idx = closestFrameIndex(merged, nowSec);
+          const ts = idx >= 0 ? merged[idx] : undefined;
+          setActiveTs(ts);
+          setDesiredTs(ts);
+          setFrameIdx(Math.max(0, idx));
+        }
       } catch {}
     };
     fetchFrames();
     radarRefreshTimer.current = setInterval(fetchFrames, 3 * 60 * 1000);
-    return () => radarRefreshTimer.current && clearInterval(radarRefreshTimer.current);
+    return () => { if (radarRefreshTimer.current) { clearInterval(radarRefreshTimer.current); radarRefreshTimer.current = null; } };
   }, []);
 
-  // Slider (minutes offset) → closest available frame timestamp
-  const selectedTs = useMemo(() => {
-    if (!frames.length) return undefined;
+  // window frames (last 2h)
+  const windowFrames = useMemo(() => {
     const nowSec = Math.floor(Date.now() / 1000);
-    const target = nowSec + sliderOffsetMin * 60; // sliderOffsetMin ≤ 0
-    const idx = closestFrameIndex(frames, target);
-    return idx >= 0 ? frames[idx] : undefined;
-  }, [frames, sliderOffsetMin]);
+    const twoHoursAgo = nowSec - 120 * 60;
+    const w = frames.filter(ts => ts >= twoHoursAgo && ts <= nowSec);
+    return w.slice(-MAX_FRAMES_TO_CACHE);
+  }, [frames]);
 
-  const radarUrlTemplate =
-    selectedTs !== undefined
-      ? `https://tilecache.rainviewer.com/v2/radar/${selectedTs}/256/{z}/{x}/{y}/2/1_1.png`
-      : undefined;
+  // keep frameIdx valid when window updates
+  useEffect(() => {
+    if (!windowFrames.length) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const idx = closestFrameIndex(windowFrames, nowSec);
+    setFrameIdx(Math.max(0, Math.min(idx, windowFrames.length - 1)));
+  }, [windowFrames]);
 
-  // Labels for bottom UI
+  // commit desiredTs from frameIdx changes
+  useEffect(() => {
+    if (!windowFrames.length) return;
+    const idx = Math.max(0, Math.min(frameIdx, windowFrames.length - 1));
+    setDesiredTs(windowFrames[idx]);
+  }, [frameIdx, windowFrames]);
+
+  /** ===== Prefetch helpers ===== */
+  const TILE_SIZE = Platform.OS === "ios" ? TILE_SIZE_IOS : TILE_SIZE_ANDROID;
+
+  const schedulePrefetchAll = (r: Region | null, framesToPrefetch: number[]) => {
+    if (!r || !framesToPrefetch.length) return;
+    if (prefetchDebounce.current) { clearTimeout(prefetchDebounce.current); prefetchDebounce.current = null; }
+
+    prefetchDebounce.current = setTimeout(async () => {
+      const zApprox = Math.min(MAX_NATIVE_Z, Math.max(0, Math.round(regionToZoom(r))));
+      const base = lngLatToTile(r.longitude, r.latitude, zApprox);
+
+      const tasks: Array<() => Promise<unknown>> = [];
+      for (const ts of framesToPrefetch) {
+        for (const dz of PREFETCH_Z_SPREAD) {
+          const z = Math.max(0, Math.min(MAX_NATIVE_Z, base.z + dz));
+          for (let dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
+            for (let dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
+              const x = base.x + dx, y = base.y + dy;
+              const url = tileUrl(ts, z, x, y, TILE_SIZE);
+              tasks.push(() => prefetchUrlOnce(url));
+            }
+          }
+        }
+      }
+      await runWithConcurrency(tasks, CONCURRENCY);
+    }, PREFETCH_DEBOUNCE_MS);
+  };
+
+  // prefetch when region or windowFrames change
+  useEffect(() => { schedulePrefetchAll(region, windowFrames); }, [region, windowFrames]);
+
+  // prefetch desiredTs neighborhood; swap when ready
+  useEffect(() => {
+    if (!desiredTs) return;
+    if (!region) { setActiveTs(desiredTs); return; }
+
+    setIsLoadingFrame(true);
+    const zClamp = Math.min(MAX_NATIVE_Z, Math.max(0, Math.round(regionToZoom(region))));
+    const base = lngLatToTile(region.longitude, region.latitude, zClamp);
+
+    const urls: string[] = [];
+    for (const dz of PREFETCH_Z_SPREAD) {
+      const z = Math.max(0, Math.min(MAX_NATIVE_Z, base.z + dz));
+      for (let dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
+        for (let dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
+          const x = base.x + dx, y = base.y + dy;
+          urls.push(tileUrl(desiredTs, z, x, y, TILE_SIZE));
+        }
+      }
+    }
+
+    const tasks = urls.map(u => () => prefetchUrlOnce(u));
+    runWithConcurrency(tasks, CONCURRENCY).finally(() => {
+      setActiveTs(desiredTs);
+      setIsLoadingFrame(false);
+    });
+
+    return () => setIsLoadingFrame(false);
+  }, [desiredTs, region]);
+
+  // labels
   const liveClock = `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
-  const selectedDate = selectedTs ? new Date(selectedTs * 1000) : null;
-  const frameLabel = selectedDate
-    ? selectedDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : "—";
+  const shownIdx = pendingIdx ?? frameIdx;
+  const shownTs = windowFrames[shownIdx] ?? activeTs;
+  const selectedDate = shownTs ? new Date(shownTs * 1000) : null;
+  const frameLabel = selectedDate ? selectedDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
   const deltaMin = selectedDate ? Math.round((selectedDate.getTime() - now.getTime()) / 60000) : 0;
   const deltaLabel = deltaMin === 0 ? "now" : `${deltaMin} min`;
 
   if (loading || !destination) {
-    return (
-      <View style={[styles.center, styles.container]}>
-        <Text>{loading ? "Locating…" : "Missing destination"}</Text>
-      </View>
-    );
+    return <View style={[styles.center, styles.container]}><Text>{loading ? "Locating…" : "Missing destination"}</Text></View>;
   }
 
   const initialRegion: Region = {
@@ -214,23 +323,39 @@ export default function MapScreen() {
     longitudeDelta: 0.03,
   };
 
+  // Android: Google Maps TileOverlay uses 'transparency' (0..1). iOS uses 'opacity' (0..1).
+  const androidTransparency = 1 - Math.max(0, Math.min(1, radarOpacity));
+  const urlTileCommonProps: any = {
+    maximumNativeZ: MAX_NATIVE_Z,
+    maximumZ: MAP_MAX_Z,
+    tileSize: TILE_SIZE,
+    zIndex: 999,
+    shouldReplaceMapContent: false,
+  };
+
   return (
     <View style={styles.container}>
       <MapView
+        provider={PROVIDER_GOOGLE}
         ref={mapRef}
         style={styles.map}
         initialRegion={initialRegion}
+        onRegionChangeComplete={(r) => setRegion(r)}
         showsUserLocation
         followsUserLocation={false}
         showsMyLocationButton={Platform.OS === "android"}
+        maxZoomLevel={MAP_MAX_Z}
       >
-        {radarEnabled && radarUrlTemplate && (
+        {radarEnabled && activeTs && (
           <UrlTile
-            urlTemplate={radarUrlTemplate}
-            zIndex={10}          // keep radar below route
-            opacity={radarOpacity}
-            maximumZ={12}        // ensures visibility at deep zoom
-            tileSize={256}
+            key={`${activeTs}-${TILE_SIZE}`} // force remount on frame change
+            urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${TILE_SIZE}/{z}/{x}/{y}/2/1_1.png`}
+            {...urlTileCommonProps}
+            // iOS:
+            opacity={Platform.OS === "ios" ? radarOpacity : 1}
+            // Android (Google provider):
+            // @ts-ignore - available on recent RN Maps; safe to forward to native
+            tileOverlayTransparency={Platform.OS === "android" ? androidTransparency : 0}
           />
         )}
 
@@ -245,48 +370,46 @@ export default function MapScreen() {
         />
       </MapView>
 
-      {/* Top: thinner controls (no time here) */}
+      {/* Top controls */}
       <View style={styles.topWrap}>
         <View style={styles.controls}>
-          <Pressable
-            style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]}
-            onPress={() => setRadarEnabled((v) => !v)}
-          >
+          <Pressable style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]} onPress={() => setRadarEnabled(v => !v)}>
             <Text style={styles.btnText}>{radarEnabled ? "Radar: ON" : "Radar: OFF"}</Text>
           </Pressable>
-
           <View style={styles.row}>
-            <Pressable
-              style={styles.smallBtn}
-              onPress={() => setRadarOpacity((o) => Math.max(0, +(o - 0.1).toFixed(2)))}
-              disabled={!radarEnabled}
-            >
+            <Pressable style={styles.smallBtn} onPress={() => setRadarOpacity(o => Math.max(0, +(o - 0.1).toFixed(2)))} disabled={!radarEnabled}>
               <Text style={styles.smallBtnText}>–</Text>
             </Pressable>
             <Text style={styles.opacityLabel}>{Math.round(radarOpacity * 100)}%</Text>
-            <Pressable
-              style={styles.smallBtn}
-              onPress={() => setRadarOpacity((o) => Math.min(1, +(o + 0.1).toFixed(2)))}
-              disabled={!radarEnabled}
-            >
+            <Pressable style={styles.smallBtn} onPress={() => setRadarOpacity(o => Math.min(1, +(o + 0.1).toFixed(2)))} disabled={!radarEnabled}>
               <Text style={styles.smallBtnText}>+</Text>
             </Pressable>
           </View>
         </View>
       </View>
 
-      {/* Bottom: past-only slider + times */}
+      {/* Bottom slider (frame index) + times + loading */}
       <View style={styles.bottomWrap}>
         <View style={styles.sliderWrap}>
-          <Text style={styles.sliderLabel}>Past 2h  ←  Time  →  now</Text>
+          <Text style={styles.sliderLabel}>
+            {windowFrames.length ? `Frames (last 2h): ${windowFrames.length}` : "Loading radar timeline…"}
+          </Text>
 
           <Slider
             style={styles.slider}
-            value={sliderOffsetMin}
-            onValueChange={(n: number) => setSliderOffsetMin(Math.round(n))}
-            minimumValue={MIN_OFFSET}
-            maximumValue={MAX_OFFSET}
+            value={Math.min(shownIdx, Math.max(0, windowFrames.length - 1))}
+            // Keep UI super-smooth: only update label while sliding…
+            onValueChange={(n: number) => setPendingIdx(Math.round(n))}
+            // …and commit the real frame swap (prefetch + UrlTile key change) at the end
+            onSlidingComplete={(n: number) => {
+              const idx = Math.round(n);
+              setPendingIdx(null);
+              setFrameIdx(idx);
+            }}
+            minimumValue={0}
+            maximumValue={Math.max(0, windowFrames.length - 1)}
             step={1}
+            disabled={!windowFrames.length}
             minimumTrackTintColor="#007AFF"
             maximumTrackTintColor="#c7c7cc"
             thumbTintColor="#007AFF"
@@ -294,99 +417,59 @@ export default function MapScreen() {
 
           <View style={styles.timebar}>
             <Text style={styles.liveText}>● Live {liveClock}</Text>
-            <Text style={styles.subText}>Frame: {frameLabel} ({deltaLabel})</Text>
+            <Text style={styles.subText}>Frame: {frameLabel} ({deltaMin === 0 ? "now" : `${deltaMin} min`})</Text>
           </View>
+
+          {isLoadingFrame && (
+            <View style={styles.loadingRow}>
+              <ActivityIndicator size="small" />
+              <Text style={styles.loadingText}> Fetching weather radar frame…</Text>
+            </View>
+          )}
         </View>
       </View>
     </View>
   );
 }
 
-// ---------- Styles ----------
+/** ===== styles ===== */
 const styles = StyleSheet.create({
   container: { flex: 1 },
   map: { flex: 1 },
   center: { justifyContent: "center", alignItems: "center" },
 
-  // Thinner, screen-fitting top bar
-  topWrap: {
-    position: "absolute",
-    top: 10,
-    left: 10,
-    right: 10,
-  },
+  topWrap: { position: "absolute", top: 10, left: 10, right: 10 },
   controls: {
     alignSelf: "stretch",
     backgroundColor: "rgba(255,255,255,0.95)",
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    borderRadius: 10,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    flexWrap: "wrap",
-    gap: 6,
-    shadowColor: "#000",
-    shadowOpacity: 0.12,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 2 },
+    paddingHorizontal: 8, paddingVertical: 6, borderRadius: 10,
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    flexWrap: "wrap", gap: 6,
+    shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 6, shadowOffset: { width: 0, height: 2 },
   },
-  btn: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    minWidth: 88,
-    alignItems: "center",
-  },
-  btnOn: { backgroundColor: "#00796b" },
-  btnOff: { backgroundColor: "#9e9e9e" },
+  btn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, minWidth: 88, alignItems: "center" },
+  btnOn: { backgroundColor: "#00796b" }, btnOff: { backgroundColor: "#9e9e9e" },
   btnText: { color: "#fff", fontWeight: "700", fontSize: 13 },
 
   row: { flexDirection: "row", alignItems: "center", gap: 6 },
-  smallBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 7,
-    backgroundColor: "#607d8b",
-    alignItems: "center",
-    justifyContent: "center",
-  },
+  smallBtn: { width: 28, height: 28, borderRadius: 7, backgroundColor: "#607d8b", alignItems: "center", justifyContent: "center" },
   smallBtnText: { color: "#fff", fontSize: 16, fontWeight: "800" },
   opacityLabel: { minWidth: 40, textAlign: "center", fontWeight: "700", color: "#111", fontSize: 12 },
 
-  bottomWrap: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 18,
-    paddingHorizontal: 12,
-  },
+  bottomWrap: { position: "absolute", left: 0, right: 0, bottom: 18, paddingHorizontal: 12 },
   sliderWrap: {
     alignSelf: "stretch",
     backgroundColor: "rgba(255,255,255,0.95)",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderRadius: 12,
-    shadowColor: "#000",
-    shadowOpacity: 0.12,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 2 },
+    paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12,
+    shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 8, shadowOffset: { width: 0, height: 2 },
   },
-  sliderLabel: {
-    textAlign: "center",
-    marginBottom: 6,
-    color: "#111",
-    fontWeight: "600",
-    fontSize: 13,
-  },
+  sliderLabel: { textAlign: "center", marginBottom: 6, color: "#111", fontWeight: "600", fontSize: 13 },
   slider: { width: "100%", height: 30 },
 
-  timebar: {
-    marginTop: 6,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "baseline",
-  },
+  timebar: { marginTop: 6, flexDirection: "row", justifyContent: "space-between", alignItems: "baseline" },
   liveText: { fontSize: 12, fontWeight: "700", color: "#1b5e20" },
   subText: { fontSize: 11, color: "#333" },
+
+  loadingRow: { marginTop: 8, flexDirection: "row", alignItems: "center", justifyContent: "center" },
+  loadingText: { marginLeft: 6, fontSize: 12, color: "#111", fontWeight: "600" },
 });
