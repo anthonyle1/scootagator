@@ -1,7 +1,22 @@
 // app/MapScreen.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, StyleSheet, Platform, Pressable, Image, ActivityIndicator } from "react-native";
-import MapView, { Marker, Polyline, LatLng, Region, UrlTile, PROVIDER_GOOGLE } from "react-native-maps";
+import {
+  View,
+  Text,
+  StyleSheet,
+  Platform,
+  Pressable,
+  Image,
+  ActivityIndicator,
+} from "react-native";
+import MapView, {
+  Marker,
+  Polyline,
+  LatLng,
+  Region,
+  UrlTile,
+  PROVIDER_GOOGLE,
+} from "react-native-maps";
 import { useLocalSearchParams } from "expo-router";
 import * as Location from "expo-location";
 import Slider from "@react-native-community/slider";
@@ -10,16 +25,19 @@ const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string
 
 type Coords = LatLng;
 
-/** ===== Tunables ===== */
-const MAX_NATIVE_Z = 12;             // RainViewer native max zoom
-const MAP_MAX_Z = 22;                // allow deep zoom; tiles upscale
-const TILE_SIZE_IOS = 256;           // iOS: safer with 256
-const TILE_SIZE_ANDROID = 512;       // Android: crisp with 512
-const NEIGHBOR_RADIUS = 1;           // 3x3 neighborhood
-const PREFETCH_Z_SPREAD = [0, -1];   // prefetch zClamp and zClamp-1
-const CONCURRENCY = 6;               // prefetch pool size
-const PREFETCH_DEBOUNCE_MS = 150;    // debounce region/frame prefetch
-const MAX_FRAMES_TO_CACHE = 18;      // ~last 2h at ~6-10min cadence
+/** ===== Customizable Testing Variables ===== */
+const MAX_NATIVE_Z = 12;                // RainViewer native max zoom
+const MAP_MAX_Z = 22;                   // allow deep zoom; tiles upscale
+const TILE_SIZE_IOS = 256;              // iOS: safer with 256
+const TILE_SIZE_ANDROID = 512;          // Android: crisp with 512
+const NEIGHBOR_RADIUS = 1;              // 3x3 neighborhood
+const PREFETCH_Z_SPREAD = [0, -1];      // prefetch zClamp and zClamp-1
+const CONCURRENCY = 8;                  // prefetch pool size (a bit higher for warm-up)
+const PREFETCH_DEBOUNCE_MS = 150;       // debounce region/frame prefetch
+const MAX_FRAMES_TO_CACHE = 18;         // ~last 2h at ~6-10min cadence
+const ANIM_MS = 2500;                   // playback speed
+const ANIM_PINGPONG = false;            // forward/back loop
+const WARM_START_THRESHOLD = 0.85;      // start playing once 85% of tiles cached
 
 /** ===== Helpers ===== */
 function pad2(n: number) { return String(n).padStart(2, "0"); }
@@ -87,13 +105,17 @@ async function prefetchUrlOnce(url: string) {
   if (ok) tileCache.add(url);
   return ok;
 }
-async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency = CONCURRENCY) {
-  let i = 0;
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency = CONCURRENCY, onProgress?: (done: number, total: number) => void) {
+  let i = 0, done = 0;
+  const total = tasks.length;
   const results: Promise<T>[] = [];
   const workers = new Array(Math.min(concurrency, tasks.length)).fill(0).map(async () => {
     while (i < tasks.length) {
       const idx = i++;
-      results[idx] = tasks[idx]();
+      results[idx] = tasks[idx]().finally(() => {
+        done += 1;
+        onProgress?.(done, total);
+      });
       await results[idx].catch(() => undefined);
     }
   });
@@ -107,6 +129,7 @@ export default function MapScreen() {
   const routeFetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const radarRefreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const prefetchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const animTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const { destLat, destLng, destName } = useLocalSearchParams();
 
@@ -137,6 +160,14 @@ export default function MapScreen() {
 
   // loading state
   const [isLoadingFrame, setIsLoadingFrame] = useState(false);
+
+  // playback
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  // warm-up
+  const [warming, setWarming] = useState(false);
+  const [warmProgress, setWarmProgress] = useState(0);
+  const lastWarmSig = useRef<string | null>(null);
 
   // clock
   const [now, setNow] = useState<Date>(new Date());
@@ -303,6 +334,62 @@ export default function MapScreen() {
     return () => setIsLoadingFrame(false);
   }, [desiredTs, region]);
 
+  /** ===== Playback warm-up ===== */
+  function warmSignature(r: Region | null, framesList: number[], tileSize: number) {
+    if (!r || !framesList.length) return null;
+    const zClamp = Math.min(MAX_NATIVE_Z, Math.max(0, Math.round(regionToZoom(r))));
+    const key = `${tileSize}|${zClamp}|${framesList[0]}-${framesList[framesList.length - 1]}|${Math.round(r.latitude * 1000)},${Math.round(r.longitude * 1000)}`;
+    return key;
+  }
+
+  async function warmPlaybackCache(r: Region, framesList: number[]) {
+    const zClamp = Math.min(MAX_NATIVE_Z, Math.max(0, Math.round(regionToZoom(r))));
+    const base = lngLatToTile(r.longitude, r.latitude, zClamp);
+
+    const urls: string[] = [];
+    for (const ts of framesList) {
+      for (const dz of PREFETCH_Z_SPREAD) {
+        const z = Math.max(0, Math.min(MAX_NATIVE_Z, base.z + dz));
+        for (let dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
+          for (let dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
+            const x = base.x + dx, y = base.y + dy;
+            urls.push(tileUrl(ts, z, x, y, TILE_SIZE));
+          }
+        }
+      }
+    }
+
+    setWarming(true);
+    setWarmProgress(0);
+    await runWithConcurrency(
+      urls.map(u => () => prefetchUrlOnce(u)),
+      CONCURRENCY,
+      (done, total) => setWarmProgress(done / total)
+    );
+    setWarming(false);
+    setWarmProgress(1);
+  }
+
+  // playback timer
+  useEffect(() => {
+    if (!isPlaying || windowFrames.length < 2) {
+      if (animTimer.current) { clearInterval(animTimer.current); animTimer.current = null; }
+      return;
+    }
+    if (animTimer.current) clearInterval(animTimer.current);
+
+    animTimer.current = setInterval(() => {
+      setFrameIdx(prev => {
+        const last = windowFrames.length - 1;
+        return prev >= last ? 0 : prev + 1; // always forward, then wrap
+      });
+    }, ANIM_MS);
+
+    return () => {
+      if (animTimer.current) { clearInterval(animTimer.current); animTimer.current = null; }
+    };
+  }, [isPlaying, windowFrames.length, ANIM_MS]);
+
   // labels
   const liveClock = `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
   const shownIdx = pendingIdx ?? frameIdx;
@@ -310,7 +397,6 @@ export default function MapScreen() {
   const selectedDate = shownTs ? new Date(shownTs * 1000) : null;
   const frameLabel = selectedDate ? selectedDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
   const deltaMin = selectedDate ? Math.round((selectedDate.getTime() - now.getTime()) / 60000) : 0;
-  const deltaLabel = deltaMin === 0 ? "now" : `${deltaMin} min`;
 
   if (loading || !destination) {
     return <View style={[styles.center, styles.container]}><Text>{loading ? "Locating…" : "Missing destination"}</Text></View>;
@@ -333,6 +419,30 @@ export default function MapScreen() {
     shouldReplaceMapContent: false,
   };
 
+  // handle pressing Play with warm-up gate
+  const onPressPlay = async () => {
+    if (!region || windowFrames.length < 2) return;
+
+    // if already warmed for this signature, play instantly
+    const sig = warmSignature(region, windowFrames, TILE_SIZE);
+    if (sig && sig === lastWarmSig.current) {
+      setIsPlaying(p => !p);
+      return;
+    }
+
+    // otherwise warm first; auto-start when threshold is reached
+    setIsPlaying(false);
+    await warmPlaybackCache(region, windowFrames);
+
+    // remember signature to avoid re-warm
+    lastWarmSig.current = sig;
+
+    // only start if we warmed sufficiently (defensive)
+    if (warmProgress >= WARM_START_THRESHOLD) {
+      setIsPlaying(true);
+    }
+  };
+
   return (
     <View style={styles.container}>
       <MapView
@@ -348,13 +458,11 @@ export default function MapScreen() {
       >
         {radarEnabled && activeTs && (
           <UrlTile
-            key={`${activeTs}-${TILE_SIZE}`} // force remount on frame change
+            key={`${activeTs}-${TILE_SIZE}-${Math.round(radarOpacity * 100)}`} // remount on frame OR opacity change
             urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${TILE_SIZE}/{z}/{x}/{y}/2/1_1.png`}
             {...urlTileCommonProps}
-            // iOS:
             opacity={Platform.OS === "ios" ? radarOpacity : 1}
-            // Android (Google provider):
-            // @ts-ignore - available on recent RN Maps; safe to forward to native
+            // @ts-ignore (prop exists on native side for Google provider on Android)
             tileOverlayTransparency={Platform.OS === "android" ? androidTransparency : 0}
           />
         )}
@@ -376,6 +484,7 @@ export default function MapScreen() {
           <Pressable style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]} onPress={() => setRadarEnabled(v => !v)}>
             <Text style={styles.btnText}>{radarEnabled ? "Radar: ON" : "Radar: OFF"}</Text>
           </Pressable>
+
           <View style={styles.row}>
             <Pressable style={styles.smallBtn} onPress={() => setRadarOpacity(o => Math.max(0, +(o - 0.1).toFixed(2)))} disabled={!radarEnabled}>
               <Text style={styles.smallBtnText}>–</Text>
@@ -383,6 +492,16 @@ export default function MapScreen() {
             <Text style={styles.opacityLabel}>{Math.round(radarOpacity * 100)}%</Text>
             <Pressable style={styles.smallBtn} onPress={() => setRadarOpacity(o => Math.min(1, +(o + 0.1).toFixed(2)))} disabled={!radarEnabled}>
               <Text style={styles.smallBtnText}>+</Text>
+            </Pressable>
+
+            <Pressable
+              style={[styles.btn, (isPlaying || warming) ? styles.btnOn : styles.btnOff]}
+              onPress={onPressPlay}
+              disabled={!windowFrames.length || warming}
+            >
+              <Text style={styles.btnText}>
+                {warming ? `Loading ${Math.round(warmProgress * 100)}%` : (isPlaying ? "Pause" : "Play")}
+              </Text>
             </Pressable>
           </View>
         </View>
@@ -397,13 +516,12 @@ export default function MapScreen() {
 
           <Slider
             style={styles.slider}
-            value={Math.min(shownIdx, Math.max(0, windowFrames.length - 1))}
-            // Keep UI super-smooth: only update label while sliding…
+            value={Math.min(pendingIdx ?? frameIdx, Math.max(0, windowFrames.length - 1))}
             onValueChange={(n: number) => setPendingIdx(Math.round(n))}
-            // …and commit the real frame swap (prefetch + UrlTile key change) at the end
             onSlidingComplete={(n: number) => {
               const idx = Math.round(n);
               setPendingIdx(null);
+              setIsPlaying(false); // pause when user scrubs
               setFrameIdx(idx);
             }}
             minimumValue={0}
@@ -417,13 +535,17 @@ export default function MapScreen() {
 
           <View style={styles.timebar}>
             <Text style={styles.liveText}>● Live {liveClock}</Text>
-            <Text style={styles.subText}>Frame: {frameLabel} ({deltaMin === 0 ? "now" : `${deltaMin} min`})</Text>
+            <Text style={styles.subText}>
+              Frame: {frameLabel} ({deltaMin === 0 ? "now" : `${deltaMin} min`})
+            </Text>
           </View>
 
-          {isLoadingFrame && (
+          {(isLoadingFrame || warming) && (
             <View style={styles.loadingRow}>
               <ActivityIndicator size="small" />
-              <Text style={styles.loadingText}> Fetching weather radar frame…</Text>
+              <Text style={styles.loadingText}>
+                {warming ? `Warming playback cache… ${Math.round(warmProgress * 100)}%` : "Fetching weather radar frame…"}
+              </Text>
             </View>
           )}
         </View>
@@ -452,9 +574,16 @@ const styles = StyleSheet.create({
   btnText: { color: "#fff", fontWeight: "700", fontSize: 13 },
 
   row: { flexDirection: "row", alignItems: "center", gap: 6 },
-  smallBtn: { width: 28, height: 28, borderRadius: 7, backgroundColor: "#607d8b", alignItems: "center", justifyContent: "center" },
+  smallBtn: {
+    height: 32,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: "#607d8b",
+    alignItems: "center",
+    justifyContent: "center",
+  },
   smallBtnText: { color: "#fff", fontSize: 16, fontWeight: "800" },
-  opacityLabel: { minWidth: 40, textAlign: "center", fontWeight: "700", color: "#111", fontSize: 12 },
+  opacityLabel: { minWidth: 40, textAlign: "center", fontWeight: "700", color: "#111", fontSize: 12, marginHorizontal: 4 },
 
   bottomWrap: { position: "absolute", left: 0, right: 0, bottom: 18, paddingHorizontal: 12 },
   sliderWrap: {
