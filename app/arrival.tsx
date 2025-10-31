@@ -150,8 +150,17 @@ const styles = StyleSheet.create({
   content: { alignItems: "center", width: "80%" },
   header: { fontSize: 28, fontWeight: "bold", marginBottom: 20, color: "#004d40" },
   message: { fontSize: 18, fontWeight: "600", marginBottom: 30, color: "#333" },
-  ratingContainer: { flexDirection: "row", justifyContent: "space-between", width: "90%", marginBottom: 30 },
+
+  // Centered dots row
+  ratingContainer: {
+    flexDirection: "row",
+    justifyContent: "center",  // centered horizontally
+    alignItems: "center",      // centered vertically
+    width: "100%",
+    marginBottom: 30,
+  },
   circle: { width: 55, height: 55, borderRadius: 27.5, marginHorizontal: 6 },
+
   button: {
     backgroundColor: "#00796b",
     paddingVertical: 14,
