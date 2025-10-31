@@ -169,6 +169,7 @@ export default function MapScreen(){
     typeof destName === "string" ? decodeURIComponent(destName) : "Destination"
   );
 
+  // Keep the original/main destination always pinned
   const [mainDestination] = useState<Coords|null>(() => {
     const lat=Number(destLat), lng=Number(destLng);
     return Number.isFinite(lat)&&Number.isFinite(lng)?{latitude:lat, longitude:lng}:null;
@@ -210,6 +211,9 @@ export default function MapScreen(){
   },[]);
   const [filterNotBusy] = useState(false);
   const [nearbyRacks, setNearbyRacks] = useState<BikeRack[]>([]);
+
+  // Track Marker refs so we can hide callouts programmatically
+  const markerRefs = useRef<Record<string | number, any>>({});
 
   // UI layout state
   const [showTimeline, setShowTimeline] = useState(false);
@@ -466,18 +470,21 @@ export default function MapScreen(){
     ? dockHeight + (timelineHeight || 0) + 24
     : dockHeight + 20;
 
-  // Switch navigation to a chosen rack
+  // Switch navigation to a chosen rack (and close its callout)
   const navigateToRack = (r: BikeRack) => {
+    // Close the callout for this rack
+    markerRefs.current[r.id]?.hideCallout?.();
+    // Navigate
     setDestination({ latitude: r.latitude, longitude: r.longitude });
     setDestLabel(r.props.RackID ? `Rack ${r.props.RackID}` : "Bike Rack");
-    // Optionally close timeline for clarity
-    // setShowTimeline(false);
   };
 
+  // Speeds and formatting
   const BIKE_MPS = 4.5;     // ~16.2 km/h
   const SCOOTER_MPS = 6.7;  // ~24.1 km/h
   const formatMins = (sec: number) => `${Math.max(1, Math.round(sec / 60))} min`;
-  const formatDistance = (m:number) => (m < 1000 ? `${Math.round(m)} m` : `${(m/1000).toFixed(1)} km`);
+  // Distance in miles
+  const formatDistanceMi = (m:number) => `${(m / 1609.344).toFixed(2)} mi`;
 
   return (
     <View style={styles.container}>
@@ -516,12 +523,16 @@ export default function MapScreen(){
           let fromMainLine: string | null = null;
           if (mainDestination) {
             const dMain = haversineMeters(mainDestination, { latitude: r.latitude, longitude: r.longitude });
-            fromMainLine = `~ ${formatDistance(dMain)} from ${mainDestLabel}`;
+            fromMainLine = `~ ${formatDistanceMi(dMain)} from ${mainDestLabel}`;
           }
 
           return (
             <Marker
               key={`rack-${r.id}`}
+              ref={(ref)=> {
+                if (ref) markerRefs.current[r.id] = ref;
+                else delete markerRefs.current[r.id];
+              }}
               coordinate={{ latitude:r.latitude, longitude:r.longitude }}
               title={r.props.RackID || "Bike Rack"}
               description={[
@@ -566,11 +577,12 @@ export default function MapScreen(){
           />
         )}
 
+        {/* Always show MAIN destination pin */}
         {mainDestination && (
           <Marker
             coordinate={mainDestination}
             title={`${mainDestLabel} (Main)`}
-            pinColor="#8E24AA"
+            pinColor="#FF0000"
             tracksViewChanges={false}
           />
         )}
@@ -713,12 +725,10 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 12,
     maxWidth: 260,
-    // optional shadow for iOS
     shadowColor: "#000",
     shadowOpacity: 0.15,
     shadowRadius: 6,
     shadowOffset: { width: 0, height: 2 },
-    // optional elevation for Android
     elevation: 3,
   },
   calloutTitle: { fontWeight: "700", fontSize: 14, marginBottom: 6, color: "#111" },
@@ -731,9 +741,7 @@ const styles = StyleSheet.create({
     alignSelf:"flex-start",
     borderRadius:8,
   },
-  calloutBtnText:{ color:"#fff", fontWeight:"700", fontSize:12 }
-  
-  ,
+  calloutBtnText:{ color:"#fff", fontWeight:"700", fontSize:12 },
 
   // Arrive FAB
   arriveFabContainer:{ position:"absolute", left:0, right:0, alignItems:"center", zIndex:1000 },
