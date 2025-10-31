@@ -18,6 +18,7 @@ import MapView, {
   UrlTile,
   PROVIDER_GOOGLE,
   Callout,
+  CalloutSubview,
 } from "react-native-maps";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as Location from "expo-location";
@@ -159,10 +160,22 @@ export default function MapScreen(){
 
   const { destLat, destLng, destName } = useLocalSearchParams();
 
-  const [destination] = useState<Coords|null>(() => {
+  // Destination is now MUTABLE so we can switch to a rack
+  const [destination, setDestination] = useState<Coords|null>(() => {
     const lat=Number(destLat), lng=Number(destLng);
     return Number.isFinite(lat)&&Number.isFinite(lng)?{latitude:lat, longitude:lng}:null;
   });
+  const [destLabel, setDestLabel] = useState<string>(() =>
+    typeof destName === "string" ? decodeURIComponent(destName) : "Destination"
+  );
+
+  const [mainDestination] = useState<Coords|null>(() => {
+    const lat=Number(destLat), lng=Number(destLng);
+    return Number.isFinite(lat)&&Number.isFinite(lng)?{latitude:lat, longitude:lng}:null;
+  });
+  const [mainDestLabel] = useState<string>(() =>
+    typeof destName === "string" ? decodeURIComponent(destName) : "Destination"
+  );
 
   const [origin, setOrigin] = useState<Coords|null>(null);
   const [routeCoords, setRouteCoords] = useState<Coords[]>([]);
@@ -201,8 +214,8 @@ export default function MapScreen(){
   // UI layout state
   const [showTimeline, setShowTimeline] = useState(false);
   const [dockHeight, setDockHeight] = useState(0);
-  const [timelineHeight, setTimelineHeight] = useState(0); // measure timeline
-  const [fabHeight, setFabHeight] = useState(0); // not essential, but handy if needed
+  const [timelineHeight, setTimelineHeight] = useState(0);
+  const [fabHeight, setFabHeight] = useState(0);
 
   const [now, setNow] = useState(new Date());
   useEffect(()=>{ const t=setInterval(()=>setNow(new Date()), 1000); return ()=>clearInterval(t); },[]);
@@ -230,6 +243,7 @@ export default function MapScreen(){
     return ()=>{ sub?.remove(); };
   },[]);
 
+  // Recompute route whenever origin or destination change
   useEffect(()=>{
     if(!origin || !destination || !GOOGLE_MAPS_APIKEY) return;
     if(routeFetchTimer.current){ clearTimeout(routeFetchTimer.current); routeFetchTimer.current=null; }
@@ -452,6 +466,19 @@ export default function MapScreen(){
     ? dockHeight + (timelineHeight || 0) + 24
     : dockHeight + 20;
 
+  // Switch navigation to a chosen rack
+  const navigateToRack = (r: BikeRack) => {
+    setDestination({ latitude: r.latitude, longitude: r.longitude });
+    setDestLabel(r.props.RackID ? `Rack ${r.props.RackID}` : "Bike Rack");
+    // Optionally close timeline for clarity
+    // setShowTimeline(false);
+  };
+
+  const BIKE_MPS = 4.5;     // ~16.2 km/h
+  const SCOOTER_MPS = 6.7;  // ~24.1 km/h
+  const formatMins = (sec: number) => `${Math.max(1, Math.round(sec / 60))} min`;
+  const formatDistance = (m:number) => (m < 1000 ? `${Math.round(m)} m` : `${(m/1000).toFixed(1)} km`);
+
   return (
     <View style={styles.container}>
       <MapView
@@ -477,38 +504,76 @@ export default function MapScreen(){
           />
         )}
 
-        {visibleRacks.map(r=>(
-          <Marker
-            key={`rack-${r.id}`}
-            coordinate={{ latitude:r.latitude, longitude:r.longitude }}
-            title={r.props.RackID || "Bike Rack"}
-            description={[
-              r.props.RackType ? `Type: ${String(r.props.RackType)}` : "",
-              Number.isFinite(r.props.BikeCapacity ?? null) ? `Capacity: ${r.props.BikeCapacity}` : "",
-            ].filter(Boolean).join("\n")}
-            pinColor={pinColorForBusy(r.props.busy?.level)}
-            opacity={1}
-            tracksViewChanges={false}
-          >
-            <Callout>
-              <View style={{ maxWidth:240 }}>
-                <Text style={{ fontWeight:"700" }}>{r.props.RackID || "Bike Rack"}</Text>
-                {!!r.props.RackType && <Text>Type: {r.props.RackType}</Text>}
-                {Number.isFinite(r.props.BikeCapacity ?? null) && <Text>Capacity: {r.props.BikeCapacity}</Text>}
-                {!!r.props.RackNotes && <Text>Notes: {r.props.RackNotes}</Text>}
-                <Text>{formatBusy(r)}</Text>
-                {!!r.props.busy?.confidence && <Text>Confidence: {Math.round((r.props.busy.confidence||0)*100)}%</Text>}
-              </View>
-            </Callout>
-          </Marker>
-        ))}
+        {visibleRacks.map(r=>{
+          // compute ETA if we have origin
+          let etaLine: string | null = null;
+          if (origin) {
+            const dist = haversineMeters(origin, { latitude: r.latitude, longitude: r.longitude });
+            const tBike = dist / BIKE_MPS;
+            const tScoot = dist / SCOOTER_MPS;
+            etaLine = `ETA: ${formatMins(tBike)} (bike) · ${formatMins(tScoot)} (scooter)`;
+          }
+          let fromMainLine: string | null = null;
+          if (mainDestination) {
+            const dMain = haversineMeters(mainDestination, { latitude: r.latitude, longitude: r.longitude });
+            fromMainLine = `~ ${formatDistance(dMain)} from ${mainDestLabel}`;
+          }
 
-        <Marker
-          coordinate={destination}
-          title={typeof destName==="string"?decodeURIComponent(destName):"Destination"}
-          pinColor="red"
-          tracksViewChanges={false}
-        />
+          return (
+            <Marker
+              key={`rack-${r.id}`}
+              coordinate={{ latitude:r.latitude, longitude:r.longitude }}
+              title={r.props.RackID || "Bike Rack"}
+              description={[
+                r.props.RackType ? `Type: ${String(r.props.RackType)}` : "",
+                Number.isFinite(r.props.BikeCapacity ?? null) ? `Capacity: ${r.props.BikeCapacity}` : "",
+              ].filter(Boolean).join("\n")}
+              pinColor={pinColorForBusy(r.props.busy?.level)}
+              opacity={1}
+              tracksViewChanges={false}
+            >
+              <Callout tooltip>
+                <View style={styles.calloutBubble}>
+                  <Text style={styles.calloutTitle}>{r.props.RackID || "Bike Rack"}</Text>
+                  {!!r.props.RackType && <Text style={styles.calloutLine}>Type: {r.props.RackType}</Text>}
+                  {Number.isFinite(r.props.BikeCapacity ?? null) && (
+                    <Text style={styles.calloutLine}>Capacity: {r.props.BikeCapacity}</Text>
+                  )}
+                  {!!r.props.RackNotes && <Text style={styles.calloutLine}>Notes: {r.props.RackNotes}</Text>}
+                  <Text style={styles.calloutLine}>{formatBusy(r)}</Text>
+                  {etaLine && <Text style={styles.calloutEta}>{etaLine}</Text>}
+                  {fromMainLine && <Text style={styles.calloutFromMain}>{fromMainLine}</Text>}
+
+                  {/* Button pinned to bottom of the bubble */}
+                  <CalloutSubview onPress={() => navigateToRack(r)}>
+                    <View style={styles.calloutBtn}>
+                      <Text style={styles.calloutBtnText}>Navigate here</Text>
+                    </View>
+                  </CalloutSubview>
+                </View>
+              </Callout>
+            </Marker>
+          );
+        })}
+
+        {/* Current destination pin */}
+        {destination && (
+          <Marker
+            coordinate={destination}
+            title={destLabel}
+            pinColor="red"
+            tracksViewChanges={false}
+          />
+        )}
+
+        {mainDestination && (
+          <Marker
+            coordinate={mainDestination}
+            title={`${mainDestLabel} (Main)`}
+            pinColor="#8E24AA"
+            tracksViewChanges={false}
+          />
+        )}
 
         {routeCoords.length>0 && (
           <Polyline
@@ -521,6 +586,7 @@ export default function MapScreen(){
         )}
       </MapView>
 
+      {/* Legend */}
       <View style={styles.legendFloating}>
         <View style={styles.legend}>
           <View style={[styles.dot,{backgroundColor:"#2E7D32"}]} />
@@ -532,12 +598,10 @@ export default function MapScreen(){
         </View>
       </View>
 
+      {/* Timeline */}
       {showTimeline && (
         <View
-          style={[
-            styles.timelineWrap,
-            { bottom: dockHeight + 16 }
-          ]}
+          style={[styles.timelineWrap, { bottom: dockHeight + 16 }]}
           onLayout={(e)=> setTimelineHeight(e.nativeEvent.layout.height)}
         >
           <View style={styles.sliderWrap}>
@@ -573,6 +637,7 @@ export default function MapScreen(){
         </View>
       )}
 
+      {/* Dock */}
       <View style={styles.dockWrap} onLayout={onDockLayout}>
         <View style={styles.controlsWrap}>
           <Pressable style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]} onPress={()=>setRadarEnabled(v=>!v)}>
@@ -596,6 +661,7 @@ export default function MapScreen(){
         </View>
       </View>
 
+      {/* Arrived FAB */}
       <View style={[styles.arriveFabContainer, { bottom: fabBottom }]}>
         <Pressable
           style={styles.arriveFab}
@@ -604,8 +670,8 @@ export default function MapScreen(){
             router.push({
               pathname: "/arrival",
               params: {
-                latitude: destination.latitude.toFixed(6),
-                longitude: destination.longitude.toFixed(6),
+                latitude: destination!.latitude.toFixed(6),
+                longitude: destination!.longitude.toFixed(6),
               },
             })
           }
@@ -640,7 +706,36 @@ const styles = StyleSheet.create({
   btnOff:{ backgroundColor:"#9e9e9e" },
   btnText:{ color:"#fff", fontWeight:"700", fontSize:12 },
 
-  // Centered Arrive FAB (kept atop for tap priority)
+  // Callout action
+  calloutBubble: {
+    backgroundColor: "#fff",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    maxWidth: 260,
+    // optional shadow for iOS
+    shadowColor: "#000",
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    // optional elevation for Android
+    elevation: 3,
+  },
+  calloutTitle: { fontWeight: "700", fontSize: 14, marginBottom: 6, color: "#111" },
+  calloutLine: { fontSize: 13, color: "#222", marginTop: 2 },
+  calloutBtn:{
+    marginTop:8,
+    backgroundColor:"#304FFE",
+    paddingHorizontal:12,
+    paddingVertical:8,
+    alignSelf:"flex-start",
+    borderRadius:8,
+  },
+  calloutBtnText:{ color:"#fff", fontWeight:"700", fontSize:12 }
+  
+  ,
+
+  // Arrive FAB
   arriveFabContainer:{ position:"absolute", left:0, right:0, alignItems:"center", zIndex:1000 },
   arriveFab:{
     paddingHorizontal:22,
@@ -665,10 +760,9 @@ const styles = StyleSheet.create({
   legend:{ flexDirection:"row", alignItems:"center", gap:6, paddingHorizontal:8, paddingVertical:4, backgroundColor:"#f5f5f5", borderRadius:8 },
   dot:{ width:10, height:10, borderRadius:5 },
   legendText:{ fontSize:12, color:"#111" },
-
   legendFloating:{ position:"absolute", top:12, left:12, zIndex:200 },
 
-  // Timeline overlay (measured so FAB can sit above it)
+  // Timeline
   timelineWrap:{ position:"absolute", left:12, right:12, zIndex:900 },
   sliderWrap:{
     alignSelf:"stretch",
@@ -683,4 +777,7 @@ const styles = StyleSheet.create({
   subText:{ fontSize:11, color:"#333" },
   loadingRow:{ marginTop:8, flexDirection:"row", alignItems:"center", justifyContent:"center" },
   loadingText:{ marginLeft:6, fontSize:12, color:"#111", fontWeight:"600" },
+
+  calloutEta:{ fontSize:12, color:"#111", marginTop:6, fontStyle:"italic" },
+  calloutFromMain:{ fontSize:12, color:"#111", marginTop:4 },
 });
