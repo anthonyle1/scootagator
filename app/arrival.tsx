@@ -1,322 +1,180 @@
-import * as Location from "expo-location";
-import { useRouter, useFocusEffect } from "expo-router";
-import { useEffect, useState, useCallback } from "react";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import {
-  FlatList,
   StyleSheet,
   Text,
-  ActivityIndicator,
   View,
-  TouchableOpacity,
+  Pressable,
+  Animated,
   Alert,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import SearchInput from "./components/SearchInput";
-import Weather from "../backend/weather";
+import { useState, useRef } from "react";
 
-const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
+import { db } from "../backend/firebase";
+import { ref, push } from "firebase/database";
 
-type RouteItem = { id: string; name: string; lat?: number; lng?: number };
-
-const GRID_COLUMNS = 3;
-const ITEM_MARGIN = 8;
-
-export default function Index() {
+export default function ArrivalPage() {
   const router = useRouter();
-  const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [customRoutes, setCustomRoutes] = useState<RouteItem[]>([]);
-  const [previousRoutes, setPreviousRoutes] = useState<RouteItem[]>([]);
-  const [showAddRouteMenu, setShowAddRouteMenu] = useState(false);
-  const [cardWidth, setCardWidth] = useState(0);
 
-  // Reset page data when returning to this screen
-  useFocusEffect(
-    useCallback(() => {
-      setShowAddRouteMenu(false);
-    }, [])
-  );
+  // Get latitude & longitude from router params
+  const params = useLocalSearchParams();
+  const latitude = Number(params.latitude);
+  const longitude = Number(params.longitude);
 
-  // Get current location
-  useEffect(() => {
-    (async () => {
-      try {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") {
-          alert("Please enable location access to use this feature.");
-          setLoading(false);
-          return;
-        }
-        const loc = await Location.getCurrentPositionAsync({});
-        setCoords({ lat: loc.coords.latitude, lng: loc.coords.longitude });
-      } catch {
-        alert("Error fetching location");
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
+  const [selected, setSelected] = useState(-1);
+  const [submitted, setSubmitted] = useState(false);
 
-  // Handle place selection from search
-  const handlePlaceSelected = async (place: { place_id: string; description: string }) => {
-    if (!coords) return;
+  const colors = ["#4CAF50", "#8BC34A", "#FFEB3B", "#FFC107", "#F44336"];
+  const animations = useRef(colors.map(() => new Animated.Value(1))).current;
+
+  // Animate circle selection
+  const handleSelect = (index) => {
+    if (submitted) return;
+    setSelected(index);
+
+    Animated.sequence([
+      Animated.spring(animations[index], {
+        toValue: 1.25,
+        speed: 10,
+        bounciness: 12,
+        useNativeDriver: true,
+      }),
+      Animated.spring(animations[index], {
+        toValue: 1,
+        speed: 10,
+        bounciness: 8,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
+  // Button press animations
+  const createPressAnim = () => new Animated.Value(1);
+  const handlePressIn = (anim) =>
+    Animated.spring(anim, { toValue: 0.95, useNativeDriver: true }).start();
+  const handlePressOut = (anim) =>
+    Animated.spring(anim, { toValue: 1, friction: 3, useNativeDriver: true }).start();
+
+  const submitAnim = useRef(createPressAnim()).current;
+  const exitAnim = useRef(createPressAnim()).current;
+
+  // Submit rating to Firebase
+  const handleSubmit = async () => {
+    if (selected < 0) {
+      Alert.alert("Please select a rating before submitting.");
+      return;
+    }
+    setSubmitted(true);
+
     try {
-      const res = await fetch(
-        `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place.place_id}&key=${GOOGLE_MAPS_APIKEY}`
-      );
-      const json = await res.json();
-      const loc = json?.result?.geometry?.location;
-      if (!loc) return alert("Unable to fetch location details");
-
-      setPreviousRoutes((prev) => {
-        const updated = [
-          { id: Date.now().toString(), name: place.description, lat: loc.lat, lng: loc.lng },
-          ...prev.filter((r) => r.name !== place.description),
-        ];
-        return updated.slice(0, 10);
+      const ratingsRef = ref(db, "parking-feedback");
+      await push(ratingsRef, {
+        latitude,
+        longitude,
+        rating: selected + 1, // 1–5 scale
+        timestamp: Date.now(),
       });
-
-      router.push({
-        pathname: "/MapScreen",
-        params: {
-          userLat: String(coords.lat),
-          userLng: String(coords.lng),
-          destLat: String(loc.lat),
-          destLng: String(loc.lng),
-          destName: encodeURIComponent(place.description),
-          startRoute: "true",
-        },
-      });
-    } catch {
-      alert("Failed to fetch place details");
+      console.log("Rating successfully sent to Firebase!");
+      Alert.alert("✅ Submitted", "Your rating has been sent.");
+    } catch (error) {
+      console.error("Firebase push failed:", error);
+      Alert.alert("Error", "Failed to send rating. Check console.");
     }
   };
 
-  const handleRoutePress = (item: RouteItem) => {
-    if (item.id === "add") return setShowAddRouteMenu(true);
-    if (!coords || item.lat === undefined || item.lng === undefined)
-      return alert("Route coordinates not set");
-
-    setPreviousRoutes((prev) => {
-      const updated = [
-        { id: Date.now().toString(), name: item.name, lat: item.lat, lng: item.lng },
-        ...prev.filter((r) => r.name !== item.name),
-      ];
-      return updated.slice(0, 10);
-    });
-
-    router.push({
-      pathname: "/MapScreen",
-      params: {
-        userLat: String(coords.lat),
-        userLng: String(coords.lng),
-        destLat: String(item.lat),
-        destLng: String(item.lng),
-        destName: encodeURIComponent(item.name),
-        startRoute: "true",
-      },
-    });
-  };
-
-  const renderRouteItem = ({ item }: { item: RouteItem }) => {
-    const maxItemWidth = 100;
-    const calculatedWidth = cardWidth
-      ? (cardWidth - ITEM_MARGIN * (GRID_COLUMNS - 1)) / GRID_COLUMNS
-      : 0;
-    const itemWidth = Math.min(calculatedWidth, maxItemWidth);
-
-    return (
-      <View style={{ margin: ITEM_MARGIN / 2 }}>
-        <TouchableOpacity
-          style={[styles.gridItem, { width: itemWidth, aspectRatio: 1 }]}
-          onPress={() => handleRoutePress(item)}
-        >
-          <Text style={styles.gridItemText}>{item.name}</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  };
-
-  const savedRoutes = [...customRoutes, { id: "add", name: "Add a Route" }];
-
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <FlatList
-        data={[{ key: "content" }]}
-        renderItem={() => (
-          <View
-            style={styles.card}
-            onLayout={(event) => setCardWidth(event.nativeEvent.layout.width)}
-          >
-            <Text style={styles.title}>Where are you going today?</Text>
+    <SafeAreaView style={styles.container}>
+      <View style={styles.content}>
+        <Text style={styles.header}>Rate Parking</Text>
+        <Text style={styles.message}>How full is the parking?</Text>
 
-            {loading ? (
-              <ActivityIndicator size="large" color="#007AFF" />
-            ) : (
-              <SearchInput
-                apiKey={GOOGLE_MAPS_APIKEY}
-                onPlaceSelected={handlePlaceSelected}
-                placeholder="Search nearby places..."
+        <View style={styles.ratingContainer}>
+          {colors.map((color, index) => (
+            <Pressable
+              key={index}
+              onPress={() => handleSelect(index)}
+              disabled={submitted}
+            >
+              <Animated.View
+                style={[
+                  styles.circle,
+                  {
+                    backgroundColor: index <= selected ? color : "#ddd",
+                    transform: [{ scale: animations[index] }],
+                  },
+                ]}
               />
-            )}
+            </Pressable>
+          ))}
+        </View>
 
-            {showAddRouteMenu && (
-              <View style={[styles.card, styles.addRouteCard]}>
-                <Text style={styles.sectionTitle}>Add a New Route</Text>
-                <SearchInput
-                  apiKey={GOOGLE_MAPS_APIKEY}
-                  onPlaceSelected={async (place) => {
-                    try {
-                      const res = await fetch(
-                        `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place.place_id}&key=${GOOGLE_MAPS_APIKEY}`
-                      );
-                      const json = await res.json();
-                      const loc = json?.result?.geometry?.location;
-                      if (!loc) return alert("Unable to fetch location details");
+        {/* Submit Button */}
+        <Pressable
+          onPressIn={() => handlePressIn(submitAnim)}
+          onPressOut={() => handlePressOut(submitAnim)}
+          onPress={handleSubmit}
+          disabled={submitted}
+        >
+          <Animated.View
+            style={[
+              styles.button,
+              submitted && styles.disabledButton,
+              { transform: [{ scale: submitAnim }] },
+            ]}
+          >
+            <Text style={styles.buttonText}>
+              {submitted ? "Submitted" : "Submit"}
+            </Text>
+          </Animated.View>
+        </Pressable>
 
-                      const newRoute: RouteItem = {
-                        id: String(Date.now()),
-                        name: place.description,
-                        lat: loc.lat,
-                        lng: loc.lng,
-                      };
-
-                      setCustomRoutes([...customRoutes, newRoute]);
-                      setShowAddRouteMenu(false);
-                    } catch {
-                      alert("Failed to fetch location details");
-                    }
-                  }}
-                  placeholder="Search a location to add..."
-                />
-                <TouchableOpacity
-                  style={styles.cancelButton}
-                  onPress={() => setShowAddRouteMenu(false)}
-                >
-                  <Text style={{ color: "#007AFF", fontWeight: "600" }}>Cancel</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-
-            <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>Saved routes:</Text>
-              {customRoutes.length > 0 && (
-                <TouchableOpacity
-                  style={styles.removeRouteButton}
-                  onPress={() => {
-                    Alert.alert(
-                      "Remove a Route",
-                      "Which route do you want to remove?",
-                      customRoutes
-                        .map((route) => ({
-                          text: route.name,
-                          onPress: () =>
-                            setCustomRoutes(customRoutes.filter((r) => r.id !== route.id)),
-                        }))
-                        .concat({ text: "Cancel", style: "cancel" }),
-                      { cancelable: true }
-                    );
-                  }}
-                >
-                  <Text style={styles.removeRouteText}>Remove</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-
-            <FlatList
-              data={savedRoutes}
-              renderItem={renderRouteItem}
-              keyExtractor={(item) => item.id}
-              numColumns={GRID_COLUMNS}
-              scrollEnabled={false}
-            />
-
-            <Text style={styles.sectionTitle}>Previous routes:</Text>
-            <FlatList
-              data={previousRoutes}
-              keyExtractor={(item) => item.id}
-              renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={styles.previousRouteItem}
-                  onPress={() => handleRoutePress(item)}
-                >
-                  <Text style={styles.previousRouteText}>{item.name}</Text>
-                </TouchableOpacity>
-              )}
-              scrollEnabled
-              showsVerticalScrollIndicator
-              style={styles.previousRoutesList}
-            />
-          </View>
-        )}
-        keyExtractor={(item) => item.key}
-        ListFooterComponent={
-          <View style={[styles.card, styles.weatherContainer]}>
-            <Text style={styles.sectionTitle}>Your Local Weather</Text>
-            {coords ? (
-              <Weather lat={coords.lat} lng={coords.lng} label="Current Location" />
-            ) : (
-              <Text>Fetching location...</Text>
-            )}
-          </View>
-        }
-        contentContainerStyle={styles.scrollContainer}
-      />
+        {/* Exit Button */}
+        <Pressable
+          onPressIn={() => handlePressIn(exitAnim)}
+          onPressOut={() => handlePressOut(exitAnim)}
+          onPress={() => {router.back(); 
+            router.back();}}
+        >
+          <Animated.View
+            style={[styles.button, styles.exitButton, { transform: [{ scale: exitAnim }] }]}
+          >
+            <Text style={styles.buttonText}>End This Trip</Text>
+          </Animated.View>
+        </Pressable>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: "#333" },
-  scrollContainer: { padding: 15, paddingBottom: 50 },
-  card: {
-    backgroundColor: "white",
-    borderRadius: 12,
-    padding: 20,
-    marginBottom: 15,
-    overflow: "hidden",
-  },
-  title: { fontSize: 28, fontWeight: "bold", marginBottom: 20, color: "#111" },
-  sectionHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 8,
-  },
-  sectionTitle: { fontSize: 18, fontWeight: "600", color: "#222" },
-  gridItem: {
-    margin: ITEM_MARGIN / 5,
-    backgroundColor: "#e0e0e0",
-    borderRadius: 8,
+  container: {
+    flex: 1,
+    backgroundColor: "#fff",
     justifyContent: "center",
     alignItems: "center",
-    maxWidth: 100,
-    flex: 1,
   },
-  gridItemText: { fontSize: 12, fontWeight: "600", color: "#555", textAlign: "center" },
-  weatherContainer: {
-    backgroundColor: "rgba(124, 170, 255, 0.8)",
-    borderRadius: 18,
-    padding: 20,
-    borderWidth: 1,
-    borderColor: "rgba(100, 149, 237, 0.2)",
+  content: { alignItems: "center", width: "80%" },
+  header: { fontSize: 28, fontWeight: "bold", marginBottom: 20, color: "#004d40" },
+  message: { fontSize: 18, fontWeight: "600", marginBottom: 30, color: "#333" },
+
+  ratingContainer: {
+    flexDirection: "row",
+    justifyContent: "center",
+    alignItems: "center",
+    width: "100%",
+    marginBottom: 30,
   },
-  addRouteCard: { backgroundColor: "#f5f5f5", marginBottom: 15 },
-  cancelButton: { marginTop: 10, alignSelf: "flex-end" },
-  removeRouteButton: {
-    backgroundColor: "red",
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    borderRadius: 8,
+  circle: { width: 55, height: 55, borderRadius: 27.5, marginHorizontal: 6 },
+
+  button: {
+    backgroundColor: "#00796b",
+    paddingVertical: 14,
+    width: 220,
+    borderRadius: 40,
+    marginBottom: 20,
+    alignItems: "center",
   },
-  removeRouteText: { color: "white", fontWeight: "600", fontSize: 13 },
-  previousRoutesList: { maxHeight: 200 },
-  previousRouteItem: {
-    backgroundColor: "#d0d0d0",
-    borderRadius: 8,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    marginBottom: 10,
-  },
-  previousRouteText: { fontSize: 14, fontWeight: "600", color: "#333" },
+  exitButton: { backgroundColor: "#009688" },
+  buttonText: { color: "#fff", fontWeight: "bold", fontSize: 16, textAlign: "center" },
+  disabledButton: { backgroundColor: "#9e9e9e" },
 });
