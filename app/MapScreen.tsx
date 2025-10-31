@@ -8,6 +8,7 @@ import {
   Pressable,
   Image,
   ActivityIndicator,
+  ScrollView,
 } from "react-native";
 import MapView, {
   Marker,
@@ -16,32 +17,77 @@ import MapView, {
   Region,
   UrlTile,
   PROVIDER_GOOGLE,
+  Callout,
 } from "react-native-maps";
 import { useLocalSearchParams } from "expo-router";
 import * as Location from "expo-location";
 import Slider from "@react-native-community/slider";
 
+// Import local racks with busy metadata (GeoJSON)
+import racksGeoJSON from "../assets/data/uf_bike_racks_with_busy.json";
+
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
 
+/** ===== Types ===== */
 type Coords = LatLng;
 
-/** ===== Customizable Testing Variables ===== */
+type RackFeature = {
+  type: "Feature";
+  properties: {
+    OBJECTID?: number | null;
+    RackID?: string | null;
+    RackType?: string | null;
+    BikeCapacity?: number | null;
+    RackOwner?: string | null;
+    RackNotes?: string | null;
+    BRCondition?: string | null;
+    Cover?: number | null;
+    // Busy metadata we added:
+    busy?: {
+      level: "LOW" | "MEDIUM" | "HIGH";
+      occupancy?: number | null; // 0..1 if you want a continuous value
+      updatedAt?: string | null; // ISO datetime string
+      confidence?: number | null; // 0..1
+    };
+  };
+  geometry: { type: "Point"; coordinates: [number, number] };
+};
+
+type BikeRack = {
+  id: string | number;
+  latitude: number;
+  longitude: number;
+  props: RackFeature["properties"];
+};
+
+/** ===== Tunables ===== */
 const MAX_NATIVE_Z = 12;                // RainViewer native max zoom
 const MAP_MAX_Z = 22;                   // allow deep zoom; tiles upscale
-const TILE_SIZE_IOS = 256;              // iOS: safer with 256
-const TILE_SIZE_ANDROID = 512;          // Android: crisp with 512
-const NEIGHBOR_RADIUS = 1;              // 3x3 neighborhood
-const PREFETCH_Z_SPREAD = [0, -1];      // prefetch zClamp and zClamp-1
-const CONCURRENCY = 8;                  // prefetch pool size (a bit higher for warm-up)
-const PREFETCH_DEBOUNCE_MS = 150;       // debounce region/frame prefetch
-const MAX_FRAMES_TO_CACHE = 18;         // ~last 2h at ~6-10min cadence
-const ANIM_MS = 2500;                   // playback speed
-const ANIM_PINGPONG = false;            // forward/back loop
-const WARM_START_THRESHOLD = 0.85;      // start playing once 85% of tiles cached
+const TILE_SIZE_IOS = 256;
+const TILE_SIZE_ANDROID = 512;
+const NEIGHBOR_RADIUS = 1;
+const PREFETCH_Z_SPREAD = [0, -1];
+const CONCURRENCY = 8;
+const PREFETCH_DEBOUNCE_MS = 150;
+const MAX_FRAMES_TO_CACHE = 18;
+const ANIM_MS = 2500;
+const WARM_START_THRESHOLD = 0.85;
+
+const NEARBY_RACK_RADIUS_M = 350;
 
 /** ===== Helpers ===== */
 function pad2(n: number) { return String(n).padStart(2, "0"); }
+function haversineMeters(a: {latitude:number; longitude:number}, b:{latitude:number; longitude:number}) {
+  const R = 6371000;
+  const dLat = (b.latitude - a.latitude) * Math.PI/180;
+  const dLon = (b.longitude - a.longitude) * Math.PI/180;
+  const lat1 = a.latitude * Math.PI/180, lat2 = b.latitude * Math.PI/180;
+  const sinDLat = Math.sin(dLat/2), sinDLon = Math.sin(dLon/2);
+  const h = sinDLat*sinDLat + Math.cos(lat1)*Math.cos(lat2)*sinDLon*sinDLon;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
 
+// decode polyline utility
 function decodePolyline(t: string): Coords[] {
   const out: Coords[] = [];
   let index = 0, lat = 0, lng = 0;
@@ -112,10 +158,7 @@ async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency
   const workers = new Array(Math.min(concurrency, tasks.length)).fill(0).map(async () => {
     while (i < tasks.length) {
       const idx = i++;
-      results[idx] = tasks[idx]().finally(() => {
-        done += 1;
-        onProgress?.(done, total);
-      });
+      results[idx] = tasks[idx]().finally(() => { done += 1; onProgress?.(done, total); });
       await results[idx].catch(() => undefined);
     }
   });
@@ -144,12 +187,11 @@ export default function MapScreen() {
 
   // radar states
   const [radarEnabled, setRadarEnabled] = useState(true);
-  const [radarOpacity, setRadarOpacity] = useState(0.6);
 
   // frames + indexing
   const [frames, setFrames] = useState<number[]>([]);
   const [frameIdx, setFrameIdx] = useState(0);
-  const [pendingIdx, setPendingIdx] = useState<number | null>(null); // for smooth slider UX
+  const [pendingIdx, setPendingIdx] = useState<number | null>(null);
 
   // timestamps
   const [activeTs, setActiveTs] = useState<number | undefined>(undefined);
@@ -161,15 +203,28 @@ export default function MapScreen() {
   // loading state
   const [isLoadingFrame, setIsLoadingFrame] = useState(false);
 
-  // playback
+  // playback + warm-up
   const [isPlaying, setIsPlaying] = useState(false);
-
-  // warm-up
   const [warming, setWarming] = useState(false);
   const [warmProgress, setWarmProgress] = useState(0);
   const lastWarmSig = useRef<string | null>(null);
 
-  // clock
+  // racks (STATIC from local JSON)
+  const racks: BikeRack[] = useMemo(() => {
+    const feats = (racksGeoJSON?.features ?? []) as RackFeature[];
+    return feats.map((f) => ({
+      id: f.properties.OBJECTID ?? f.properties.RackID ?? f.geometry.coordinates.join(","),
+      latitude: f.geometry.coordinates[1],
+      longitude: f.geometry.coordinates[0],
+      props: f.properties,
+    }));
+  }, []);
+
+  const [showRacks, setShowRacks] = useState(true);
+  const [filterNotBusy, setFilterNotBusy] = useState(false); // if true, hide medium/high
+  const [nearbyRacks, setNearbyRacks] = useState<BikeRack[]>([]);
+
+  // clock (UI nicety)
   const [now, setNow] = useState<Date>(new Date());
   useEffect(() => { const t = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(t); }, []);
 
@@ -370,7 +425,7 @@ export default function MapScreen() {
     setWarmProgress(1);
   }
 
-  // playback timer
+  // playback timer (always forward, loop at end)
   useEffect(() => {
     if (!isPlaying || windowFrames.length < 2) {
       if (animTimer.current) { clearInterval(animTimer.current); animTimer.current = null; }
@@ -381,25 +436,49 @@ export default function MapScreen() {
     animTimer.current = setInterval(() => {
       setFrameIdx(prev => {
         const last = windowFrames.length - 1;
-        return prev >= last ? 0 : prev + 1; // always forward, then wrap
+        return prev >= last ? 0 : prev + 1;
       });
     }, ANIM_MS);
 
     return () => {
       if (animTimer.current) { clearInterval(animTimer.current); animTimer.current = null; }
     };
-  }, [isPlaying, windowFrames.length, ANIM_MS]);
+  }, [isPlaying, windowFrames.length]);
+
+  // compute racks near destination (for zoom button)
+  useEffect(() => {
+    if (!destination || !racks.length) { setNearbyRacks([]); return; }
+    const near = racks.filter(r =>
+      haversineMeters(destination, { latitude: r.latitude, longitude: r.longitude }) <= NEARBY_RACK_RADIUS_M
+    );
+    setNearbyRacks(near);
+  }, [destination?.latitude, destination?.longitude, racks]);
 
   // labels
-  const liveClock = `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
+  const liveClock = useMemo(() => {
+    const d = new Date();
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  }, [now]);
+
   const shownIdx = pendingIdx ?? frameIdx;
   const shownTs = windowFrames[shownIdx] ?? activeTs;
   const selectedDate = shownTs ? new Date(shownTs * 1000) : null;
   const frameLabel = selectedDate ? selectedDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
   const deltaMin = selectedDate ? Math.round((selectedDate.getTime() - now.getTime()) / 60000) : 0;
 
+  // Filters for racks
+  const visibleRacks = useMemo(() => {
+    if (!showRacks) return [];
+    if (!filterNotBusy) return racks;
+    return racks.filter(r => (r.props.busy?.level ?? "LOW") === "LOW");
+  }, [showRacks, filterNotBusy, racks]);
+
   if (loading || !destination) {
-    return <View style={[styles.center, styles.container]}><Text>{loading ? "Locating…" : "Missing destination"}</Text></View>;
+    return (
+      <View style={[styles.center, styles.container]}>
+        <Text>{loading ? "Locating…" : "Missing destination"}</Text>
+      </View>
+    );
   }
 
   const initialRegion: Region = {
@@ -409,8 +488,7 @@ export default function MapScreen() {
     longitudeDelta: 0.03,
   };
 
-  // Android: Google Maps TileOverlay uses 'transparency' (0..1). iOS uses 'opacity' (0..1).
-  const androidTransparency = 1 - Math.max(0, Math.min(1, radarOpacity));
+  const androidTransparency = 0; // we removed opacity control
   const urlTileCommonProps: any = {
     maximumNativeZ: MAX_NATIVE_Z,
     maximumZ: MAP_MAX_Z,
@@ -422,26 +500,32 @@ export default function MapScreen() {
   // handle pressing Play with warm-up gate
   const onPressPlay = async () => {
     if (!region || windowFrames.length < 2) return;
-
-    // if already warmed for this signature, play instantly
     const sig = warmSignature(region, windowFrames, TILE_SIZE);
     if (sig && sig === lastWarmSig.current) {
       setIsPlaying(p => !p);
       return;
     }
-
-    // otherwise warm first; auto-start when threshold is reached
     setIsPlaying(false);
     await warmPlaybackCache(region, windowFrames);
-
-    // remember signature to avoid re-warm
     lastWarmSig.current = sig;
-
-    // only start if we warmed sufficiently (defensive)
-    if (warmProgress >= WARM_START_THRESHOLD) {
-      setIsPlaying(true);
-    }
+    if (warmProgress >= WARM_START_THRESHOLD) setIsPlaying(true);
   };
+
+  function pinColorForBusy(level?: "LOW" | "MEDIUM" | "HIGH") {
+    switch (level) {
+      case "HIGH": return "#D32F2F";   // red
+      case "MEDIUM": return "#FB8C00"; // orange
+      default: return "#2E7D32";       // green (LOW / unknown)
+    }
+  }
+
+  function formatBusy(r: BikeRack) {
+    const b = r.props.busy;
+    if (!b) return "Busyness: unknown";
+    const occ = typeof b.occupancy === "number" ? ` (${Math.round(b.occupancy * 100)}%)` : "";
+    const upd = b.updatedAt ? `\nUpdated: ${new Date(b.updatedAt).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})}` : "";
+    return `Busyness: ${b.level}${occ}${upd}`;
+  }
 
   return (
     <View style={styles.container}>
@@ -458,11 +542,10 @@ export default function MapScreen() {
       >
         {radarEnabled && activeTs && (
           <UrlTile
-            key={`${activeTs}-${TILE_SIZE}-${Math.round(radarOpacity * 100)}`} // remount on frame OR opacity change
+            key={`${activeTs}-${TILE_SIZE}`}
             urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${TILE_SIZE}/{z}/{x}/{y}/2/1_1.png`}
             {...urlTileCommonProps}
-            opacity={Platform.OS === "ios" ? radarOpacity : 1}
-            // @ts-ignore (prop exists on native side for Google provider on Android)
+            // @ts-ignore (Android transparency prop)
             tileOverlayTransparency={Platform.OS === "android" ? androidTransparency : 0}
           />
         )}
@@ -471,6 +554,35 @@ export default function MapScreen() {
           <Polyline coordinates={routeCoords} strokeWidth={5} strokeColor="#007AFF" zIndex={20} />
         )}
 
+        {visibleRacks.map(r => (
+          <Marker
+            key={`rack-${r.id}`}
+            coordinate={{ latitude: r.latitude, longitude: r.longitude }}
+            title={r.props.RackID || "Bike Rack"}
+            description={[
+              r.props.RackType ? `Type: ${r.props.RackType}` : "",
+              Number.isFinite(r.props.BikeCapacity ?? null) ? `Capacity: ${r.props.BikeCapacity}` : "",
+            ].filter(Boolean).join("\n")}
+            pinColor={pinColorForBusy(r.props.busy?.level)}
+            opacity={1}
+          >
+            <Callout>
+              <View style={{ maxWidth: 240 }}>
+                <Text style={{ fontWeight: "700" }}>{r.props.RackID || "Bike Rack"}</Text>
+                {!!r.props.RackType && <Text>Type: {r.props.RackType}</Text>}
+                {Number.isFinite(r.props.BikeCapacity ?? null) && (
+                  <Text>Capacity: {r.props.BikeCapacity}</Text>
+                )}
+                {!!r.props.RackNotes && <Text>Notes: {r.props.RackNotes}</Text>}
+                <Text>{formatBusy(r)}</Text>
+                {!!r.props.busy?.confidence && (
+                  <Text>Confidence: {Math.round((r.props.busy.confidence || 0) * 100)}%</Text>
+                )}
+              </View>
+            </Callout>
+          </Marker>
+        ))}
+
         <Marker
           coordinate={destination}
           title={typeof destName === "string" ? decodeURIComponent(destName) : "Destination"}
@@ -478,36 +590,73 @@ export default function MapScreen() {
         />
       </MapView>
 
-      {/* Top controls */}
+      {/* Compact Top Controls: always fits via horizontal scroll */}
       <View style={styles.topWrap}>
-        <View style={styles.controls}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.controls}
+        >
           <Pressable style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]} onPress={() => setRadarEnabled(v => !v)}>
             <Text style={styles.btnText}>{radarEnabled ? "Radar: ON" : "Radar: OFF"}</Text>
           </Pressable>
 
-          <View style={styles.row}>
-            <Pressable style={styles.smallBtn} onPress={() => setRadarOpacity(o => Math.max(0, +(o - 0.1).toFixed(2)))} disabled={!radarEnabled}>
-              <Text style={styles.smallBtnText}>–</Text>
-            </Pressable>
-            <Text style={styles.opacityLabel}>{Math.round(radarOpacity * 100)}%</Text>
-            <Pressable style={styles.smallBtn} onPress={() => setRadarOpacity(o => Math.min(1, +(o + 0.1).toFixed(2)))} disabled={!radarEnabled}>
-              <Text style={styles.smallBtnText}>+</Text>
-            </Pressable>
+          <Pressable
+            style={[styles.btn, showRacks ? styles.btnOn : styles.btnOff]}
+            onPress={() => setShowRacks(v => !v)}
+          >
+            <Text style={styles.btnText}>{showRacks ? "Racks: ON" : "Racks: OFF"}</Text>
+          </Pressable>
 
-            <Pressable
-              style={[styles.btn, (isPlaying || warming) ? styles.btnOn : styles.btnOff]}
-              onPress={onPressPlay}
-              disabled={!windowFrames.length || warming}
-            >
-              <Text style={styles.btnText}>
-                {warming ? `Loading ${Math.round(warmProgress * 100)}%` : (isPlaying ? "Pause" : "Play")}
-              </Text>
-            </Pressable>
+          <Pressable
+            style={[styles.btn, filterNotBusy ? styles.btnOn : styles.btnOff]}
+            onPress={() => setFilterNotBusy(x => !x)}
+          >
+            <Text style={styles.btnText}>{filterNotBusy ? "Only Not Busy" : "All Busy Levels"}</Text>
+          </Pressable>
+
+          <Pressable
+            style={[styles.btn, (isPlaying || warming) ? styles.btnOn : styles.btnOff]}
+            onPress={onPressPlay}
+            disabled={!windowFrames.length || warming}
+          >
+            <Text style={styles.btnText}>
+              {warming ? `Warm ${Math.round(warmProgress * 100)}%` : (isPlaying ? "Pause" : "Play")}
+            </Text>
+          </Pressable>
+
+          {/* Zoom to racks near destination */}
+          <Pressable
+            style={[styles.btn, nearbyRacks.length ? styles.btnOn : styles.btnOff]}
+            onPress={() => {
+              if (!nearbyRacks.length || !mapRef.current) return;
+              const coords = nearbyRacks.map(r => ({ latitude: r.latitude, longitude: r.longitude }));
+              try {
+                mapRef.current.fitToCoordinates(coords, {
+                  edgePadding: { top: 40, bottom: 40, left: 40, right: 40 },
+                  animated: true,
+                });
+              } catch {}
+            }}
+          >
+            <Text style={styles.btnText}>
+              {nearbyRacks.length ? `Near: ${nearbyRacks.length}` : "Near: 0"}
+            </Text>
+          </Pressable>
+
+          {/* Busy legend (compact) */}
+          <View style={styles.legend}>
+            <View style={[styles.dot, { backgroundColor: "#2E7D32" }]} />
+            <Text style={styles.legendText}>Low</Text>
+            <View style={[styles.dot, { backgroundColor: "#FB8C00" }]} />
+            <Text style={styles.legendText}>Med</Text>
+            <View style={[styles.dot, { backgroundColor: "#D32F2F" }]} />
+            <Text style={styles.legendText}>High</Text>
           </View>
-        </View>
+        </ScrollView>
       </View>
 
-      {/* Bottom slider (frame index) + times + loading */}
+      {/* Bottom: frame slider & time */}
       <View style={styles.bottomWrap}>
         <View style={styles.sliderWrap}>
           <Text style={styles.sliderLabel}>
@@ -521,7 +670,7 @@ export default function MapScreen() {
             onSlidingComplete={(n: number) => {
               const idx = Math.round(n);
               setPendingIdx(null);
-              setIsPlaying(false); // pause when user scrubs
+              setIsPlaying(false);
               setFrameIdx(idx);
             }}
             minimumValue={0}
@@ -562,33 +711,25 @@ const styles = StyleSheet.create({
 
   topWrap: { position: "absolute", top: 10, left: 10, right: 10 },
   controls: {
-    alignSelf: "stretch",
-    backgroundColor: "rgba(255,255,255,0.95)",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "rgba(255,255,255,0.98)",
     paddingHorizontal: 8, paddingVertical: 6, borderRadius: 10,
-    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-    flexWrap: "wrap", gap: 6,
     shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 6, shadowOffset: { width: 0, height: 2 },
   },
-  btn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, minWidth: 88, alignItems: "center" },
+  btn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, alignItems: "center", justifyContent: "center" },
   btnOn: { backgroundColor: "#00796b" }, btnOff: { backgroundColor: "#9e9e9e" },
-  btnText: { color: "#fff", fontWeight: "700", fontSize: 13 },
+  btnText: { color: "#fff", fontWeight: "700", fontSize: 12 },
 
-  row: { flexDirection: "row", alignItems: "center", gap: 6 },
-  smallBtn: {
-    height: 32,
-    paddingHorizontal: 10,
-    borderRadius: 8,
-    backgroundColor: "#607d8b",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  smallBtnText: { color: "#fff", fontSize: 16, fontWeight: "800" },
-  opacityLabel: { minWidth: 40, textAlign: "center", fontWeight: "700", color: "#111", fontSize: 12, marginHorizontal: 4 },
+  legend: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 8, paddingVertical: 4, backgroundColor: "#f5f5f5", borderRadius: 8 },
+  dot: { width: 10, height: 10, borderRadius: 5 },
+  legendText: { fontSize: 12, color: "#111" },
 
   bottomWrap: { position: "absolute", left: 0, right: 0, bottom: 18, paddingHorizontal: 12 },
   sliderWrap: {
     alignSelf: "stretch",
-    backgroundColor: "rgba(255,255,255,0.95)",
+    backgroundColor: "rgba(255,255,255,0.98)",
     paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12,
     shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 8, shadowOffset: { width: 0, height: 2 },
   },

@@ -1,0 +1,107 @@
+{
+  "type": "FeatureCollection",
+  "name": "UF_Bike_Racks_with_Busy_SAMPLE",
+  "crs": { "type": "name", "properties": { "name": "EPSG:4326" } },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "OBJECTID": 101,
+        "RackID": "LIBW-NE-1",
+        "RackType": "Inverted U",
+        "BikeCapacity": 10,
+        "RackOwner": "UF",
+        "RackNotes": "Library West NE entrance",
+        "BRCondition": "GOOD",
+        "Cover": 0,
+        "busy": {
+          "level": "HIGH",
+          "occupancy": 0.9,
+          "updatedAt": "2025-10-31T12:05:00-04:00",
+          "confidence": 0.8
+        }
+      },
+      "geometry": { "type": "Point", "coordinates": [ -82.34058, 29.65101 ] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "OBJECTID": 102,
+        "RackID": "REITZ-S-2",
+        "RackType": "Peak",
+        "BikeCapacity": 20,
+        "RackOwner": "UF",
+        "RackNotes": "Reitz Union south patio",
+        "BRCondition": "GOOD",
+        "Cover": 1,
+        "busy": {
+          "level": "MEDIUM",
+          "occupancy": 0.55,
+          "updatedAt": "2025-10-31T12:02:00-04:00",
+          "confidence": 0.7
+        }
+      },
+      "geometry": { "type": "Point", "coordinates": [ -82.34653, 29.64641 ] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "OBJECTID": 103,
+        "RackID": "MARSTON-E-1",
+        "RackType": "Inverted U",
+        "BikeCapacity": 14,
+        "RackOwner": "UF",
+        "RackNotes": "Marston east entrance",
+        "BRCondition": "FAIR",
+        "Cover": 0,
+        "busy": {
+          "level": "LOW",
+          "occupancy": 0.2,
+          "updatedAt": "2025-10-31T11:58:00-04:00",
+          "confidence": 0.9
+        }
+      },
+      "geometry": { "type": "Point", "coordinates": [ -82.34272, 29.64858 ] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "OBJECTID": 104,
+        "RackID": "NEWELL-N-1",
+        "RackType": "Wave",
+        "BikeCapacity": 12,
+        "RackOwner": "UF",
+        "RackNotes": "Newell Hall north lawn",
+        "BRCondition": "GOOD",
+        "Cover": 0,
+        "busy": {
+          "level": "LOW",
+          "occupancy": 0.15,
+          "updatedAt": "2025-10-31T12:00:00-04:00",
+          "confidence": 0.85
+        }
+      },
+      "geometry": { "type": "Point", "coordinates": [ -82.34215, 29.64899 ] }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "OBJECTID": 105,
+        "RackID": "TURLINGTON-W-1",
+        "RackType": "Inverted U",
+        "BikeCapacity": 16,
+        "RackOwner": "UF",
+        "RackNotes": "Turlington west side",
+        "BRCondition": "GOOD",
+        "Cover": 0,
+        "busy": {
+          "level": "MEDIUM",
+          "occupancy": 0.6,
+          "updatedAt": "2025-10-31T12:03:00-04:00",
+          "confidence": 0.75
+        }
+      },
+      "geometry": { "type": "Point", "coordinates": [ -82.34474, 29.64841 ] }
+    }
+  ]
+}
