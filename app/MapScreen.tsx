@@ -8,7 +8,6 @@ import {
   Pressable,
   Image,
   ActivityIndicator,
-  ScrollView,
 } from "react-native";
 import MapView, {
   Marker,
@@ -23,7 +22,7 @@ import { useLocalSearchParams } from "expo-router";
 import * as Location from "expo-location";
 import Slider from "@react-native-community/slider";
 
-// Local racks with busy metadata (rename your file to .json and place it accordingly)
+// Local racks with busy metadata (JSON)
 import racksGeoJSON from "../assets/data/uf_bike_racks_with_busy.json";
 
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
@@ -60,10 +59,9 @@ type BikeRack = {
 };
 
 /** ===== Tunables ===== */
-const MAX_NATIVE_Z = 12;
-const MAP_MAX_Z = 22;
-const TILE_SIZE_IOS = 256;
-const TILE_SIZE_ANDROID = 512;
+const MAX_NATIVE_Z = 12;          // RainViewer native max zoom
+const MAP_MAX_Z = 22;             // Map can zoom further, but overlay capped to 12
+const TILE_SIZE = 256;            // iOS-safe tile size
 const NEIGHBOR_RADIUS = 1;
 const PREFETCH_Z_SPREAD = [0, -1];
 const CONCURRENCY = 8;
@@ -185,6 +183,7 @@ export default function MapScreen() {
 
   // radar states
   const [radarEnabled, setRadarEnabled] = useState(true);
+  const [radarOpacity, setRadarOpacity] = useState(0.5); // 0.2..1.0 via stepper
 
   // frames + indexing
   const [frames, setFrames] = useState<number[]>([]);
@@ -259,7 +258,6 @@ export default function MapScreen() {
     routeFetchTimer.current = setTimeout(async () => {
       try {
         const pts = await computeRoute(o, d);
-        console.log("route points:", pts.length);
         setRouteCoords(pts);
         const initialRegion: Region = { latitude: o.latitude, longitude: o.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 };
         if (pts.length && mapRef.current) {
@@ -268,9 +266,7 @@ export default function MapScreen() {
           mapRef.current.animateToRegion(initialRegion, 500);
         }
         setRegion((r) => r ?? initialRegion);
-      } catch (e) {
-        console.warn("computeRoute failed:", e);
-      }
+      } catch {}
     }, 600);
 
     return () => { if (routeFetchTimer.current) { clearTimeout(routeFetchTimer.current); routeFetchTimer.current = null; } };
@@ -331,8 +327,6 @@ export default function MapScreen() {
   }, [frameIdx, windowFrames]);
 
   /** ===== Prefetch helpers ===== */
-  const TILE_SIZE = Platform.OS === "ios" ? TILE_SIZE_IOS : TILE_SIZE_ANDROID;
-
   const schedulePrefetchAll = (r: Region | null, framesToPrefetch: number[]) => {
     if (!r || !framesToPrefetch.length) return;
     if (prefetchDebounce.current) { clearTimeout(prefetchDebounce.current); prefetchDebounce.current = null; }
@@ -474,6 +468,16 @@ export default function MapScreen() {
     return racks.filter(r => (r.props.busy?.level ?? "LOW") === "LOW");
   }, [showRacks, filterNotBusy, racks]);
 
+  const debugTileUrl = useMemo(() => {
+    if (!region || !activeTs) return null;
+    const zApprox = Math.min(MAX_NATIVE_Z, Math.max(0, Math.round(Math.log2(360 / region.longitudeDelta))));
+    const n = Math.pow(2, zApprox);
+    const x = Math.floor(((region.longitude + 180) / 360) * n);
+    const latRad = (region.latitude * Math.PI) / 180;
+    const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+    return `https://tilecache.rainviewer.com/v2/radar/${activeTs}/${TILE_SIZE}/${zApprox}/${x}/${y}/2/1_1.png`;
+  }, [region, activeTs]);
+
   if (loading || !destination) {
     return (
       <View style={[styles.center, styles.container]}>
@@ -489,11 +493,11 @@ export default function MapScreen() {
     longitudeDelta: 0.03,
   };
 
-  // Put radar UNDER everything & add Android transparency so route shows
+  // Radar tiles go UNDER everything. Transparency mapped per platform.
   const urlTileCommonProps: any = {
     maximumNativeZ: MAX_NATIVE_Z,
-    maximumZ: MAP_MAX_Z,
-    tileSize: Platform.OS === "ios" ? TILE_SIZE_IOS : TILE_SIZE_ANDROID,
+    maximumZ: MAX_NATIVE_Z,   // cap at 12 for RainViewer
+    tileSize: TILE_SIZE,
     zIndex: 0,
     shouldReplaceMapContent: false,
   };
@@ -528,10 +532,18 @@ export default function MapScreen() {
     return `Busyness: ${b.level}${occ}${upd}`;
   }
 
+  // opacity stepper logic
+  const stepOpacity = (delta: number) => {
+    setRadarOpacity((prev) => {
+      const next = Math.min(1, Math.max(0.2, +(prev + delta).toFixed(2)));
+      return next;
+    });
+  };
+
   return (
     <View style={styles.container}>
       <MapView
-        provider={PROVIDER_GOOGLE}
+        provider={Platform.OS === "android" ? PROVIDER_GOOGLE : undefined} // Apple provider on iOS
         ref={mapRef}
         style={styles.map}
         initialRegion={initialRegion}
@@ -543,12 +555,14 @@ export default function MapScreen() {
       >
         {radarEnabled && activeTs && (
           <UrlTile
-            key={`${activeTs}-${urlTileCommonProps.tileSize}`}
+            key={`${activeTs}-${urlTileCommonProps.tileSize}-${radarOpacity}`}
             urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${urlTileCommonProps.tileSize}/{z}/{x}/{y}/2/1_1.png`}
             {...urlTileCommonProps}
-            // Android: 0=opaque, 1=fully transparent. Give it some transparency.
+            // iOS: use 'opacity'
+            opacity={Platform.OS === "ios" ? radarOpacity : 1}
+            // Android: 0 opaque .. 1 transparent
             // @ts-ignore
-            tileOverlayTransparency={Platform.OS === "android" ? 0.45 : 0}
+            tileOverlayTransparency={Platform.OS === "android" ? 1 - radarOpacity : 0}
           />
         )}
 
@@ -596,22 +610,29 @@ export default function MapScreen() {
           pinColor="red"
         />
       </MapView>
-
-      {/* Debug banner if no route returned by Routes API */}
-      {routeCoords.length === 0 && (
-        <View style={styles.debugBanner}>
-          <Text style={styles.debugBannerText}>
-            No route polyline. Verify Google **Routes API** is enabled & billing is active.
-          </Text>
+      {radarEnabled && activeTs && debugTileUrl && (
+        <View style={styles.debugStrip}>
+          <Text numberOfLines={1} style={styles.debugStripText}>{debugTileUrl}</Text>
         </View>
       )}
 
-      {/* Compact Top Controls: fits via horizontal scroll */}
+      {/* Top Controls: wraps to fit screen (no horizontal scroll) */}
       <View style={styles.topWrap}>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.controls}>
+        <View style={styles.controlsWrap}>
           <Pressable style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]} onPress={() => setRadarEnabled(v => !v)}>
             <Text style={styles.btnText}>{radarEnabled ? "Radar: ON" : "Radar: OFF"}</Text>
           </Pressable>
+
+          <View style={styles.opacityGroup}>
+            <Text style={styles.opacityLabel}>Opacity</Text>
+            <Pressable style={[styles.stepBtn]} onPress={() => stepOpacity(-0.1)}>
+              <Text style={styles.stepText}>–</Text>
+            </Pressable>
+            <Text style={styles.opacityValue}>{Math.round(radarOpacity * 100)}%</Text>
+            <Pressable style={[styles.stepBtn]} onPress={() => stepOpacity(+0.1)}>
+              <Text style={styles.stepText}>+</Text>
+            </Pressable>
+          </View>
 
           <Pressable style={[styles.btn, showRacks ? styles.btnOn : styles.btnOff]} onPress={() => setShowRacks(v => !v)}>
             <Text style={styles.btnText}>{showRacks ? "Racks: ON" : "Racks: OFF"}</Text>
@@ -649,7 +670,6 @@ export default function MapScreen() {
             </Text>
           </Pressable>
 
-          {/* Busy legend */}
           <View style={styles.legend}>
             <View style={[styles.dot, { backgroundColor: "#2E7D32" }]} />
             <Text style={styles.legendText}>Low</Text>
@@ -658,7 +678,7 @@ export default function MapScreen() {
             <View style={[styles.dot, { backgroundColor: "#D32F2F" }]} />
             <Text style={styles.legendText}>High</Text>
           </View>
-        </ScrollView>
+        </View>
       </View>
 
       {/* Bottom: frame slider & time */}
@@ -715,19 +735,57 @@ const styles = StyleSheet.create({
   center: { justifyContent: "center", alignItems: "center" },
 
   topWrap: { position: "absolute", top: 10, left: 10, right: 10 },
-  controls: {
+  controlsWrap: {
     flexDirection: "row",
+    flexWrap: "wrap",            // <= wrap so it always fits the screen
     alignItems: "center",
     gap: 8,
     backgroundColor: "rgba(255,255,255,0.98)",
     paddingHorizontal: 8, paddingVertical: 6, borderRadius: 10,
     shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 6, shadowOffset: { width: 0, height: 2 },
   },
-  btn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, alignItems: "center", justifyContent: "center" },
-  btnOn: { backgroundColor: "#00796b" }, btnOff: { backgroundColor: "#9e9e9e" },
+
+  btn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  btnOn: { backgroundColor: "#00796b" },
+  btnOff: { backgroundColor: "#9e9e9e" },
   btnText: { color: "#fff", fontWeight: "700", fontSize: 12 },
 
-  legend: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 8, paddingVertical: 4, backgroundColor: "#f5f5f5", borderRadius: 8 },
+  // Opacity mini-control
+  opacityGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#f1f3f4",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+  },
+  opacityLabel: { fontSize: 12, fontWeight: "700", marginRight: 6, color: "#111" },
+  opacityValue: { fontSize: 12, fontWeight: "700", marginHorizontal: 6, color: "#111", minWidth: 36, textAlign: "center" },
+  stepBtn: {
+    backgroundColor: "#e0e0e0",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 6,
+    minWidth: 28,
+    alignItems: "center",
+  },
+  stepText: { fontSize: 14, fontWeight: "900", color: "#111" },
+
+  legend: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: "#f5f5f5",
+    borderRadius: 8,
+  },
   dot: { width: 10, height: 10, borderRadius: 5 },
   legendText: { fontSize: 12, color: "#111" },
 
@@ -748,14 +806,13 @@ const styles = StyleSheet.create({
   loadingRow: { marginTop: 8, flexDirection: "row", alignItems: "center", justifyContent: "center" },
   loadingText: { marginLeft: 6, fontSize: 12, color: "#111", fontWeight: "600" },
 
-  debugBanner: {
+  // Debug strip for copying tile URL into Safari (simulator)
+  debugStrip: {
     position: "absolute",
-    top: 80,
-    left: 10,
-    right: 10,
-    backgroundColor: "#ffebee",
-    padding: 8,
-    borderRadius: 8,
+    top: 80, left: 10, right: 10,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    paddingVertical: 4, paddingHorizontal: 8,
+    borderRadius: 6,
   },
-  debugBannerText: { color: "#b71c1c", fontWeight: "700" },
+  debugStripText: { color: "#fff", fontSize: 10 },
 });
