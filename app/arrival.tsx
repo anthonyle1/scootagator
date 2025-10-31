@@ -1,5 +1,4 @@
-// ArrivalPage.js
-import { Link, useLocalSearchParams } from "expo-router";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import {
   StyleSheet,
   Text,
@@ -15,6 +14,8 @@ import { db } from "../backend/firebase";
 import { ref, push } from "firebase/database";
 
 export default function ArrivalPage() {
+  const router = useRouter();
+
   // Get latitude & longitude from router params
   const params = useLocalSearchParams();
   const latitude = Number(params.latitude);
@@ -128,34 +129,38 @@ export default function ArrivalPage() {
         </Pressable>
 
         {/* Exit Button */}
-        <Link href="/" asChild>
-          <Pressable
-            onPressIn={() => handlePressIn(exitAnim)}
-            onPressOut={() => handlePressOut(exitAnim)}
+        <Pressable
+          onPressIn={() => handlePressIn(exitAnim)}
+          onPressOut={() => handlePressOut(exitAnim)}
+          onPress={() => {router.back(); 
+            router.back();}}
+        >
+          <Animated.View
+            style={[styles.button, styles.exitButton, { transform: [{ scale: exitAnim }] }]}
           >
-            <Animated.View
-              style={[styles.button, styles.exitButton, { transform: [{ scale: exitAnim }] }]}
-            >
-              <Text style={styles.buttonText}>End This Trip</Text>
-            </Animated.View>
-          </Pressable>
-        </Link>
+            <Text style={styles.buttonText}>End This Trip</Text>
+          </Animated.View>
+        </Pressable>
       </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fff", justifyContent: "center", alignItems: "center" },
+  container: {
+    flex: 1,
+    backgroundColor: "#fff",
+    justifyContent: "center",
+    alignItems: "center",
+  },
   content: { alignItems: "center", width: "80%" },
   header: { fontSize: 28, fontWeight: "bold", marginBottom: 20, color: "#004d40" },
   message: { fontSize: 18, fontWeight: "600", marginBottom: 30, color: "#333" },
 
-  // Centered dots row
   ratingContainer: {
     flexDirection: "row",
-    justifyContent: "center",  // centered horizontally
-    alignItems: "center",      // centered vertically
+    justifyContent: "center",
+    alignItems: "center",
     width: "100%",
     marginBottom: 30,
   },
