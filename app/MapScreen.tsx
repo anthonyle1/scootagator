@@ -32,12 +32,29 @@ const TILE_SIZE_IOS = 256;              // iOS: safer with 256
 const TILE_SIZE_ANDROID = 512;          // Android: crisp with 512
 const NEIGHBOR_RADIUS = 1;              // 3x3 neighborhood
 const PREFETCH_Z_SPREAD = [0, -1];      // prefetch zClamp and zClamp-1
-const CONCURRENCY = 8;                  // prefetch pool size (a bit higher for warm-up)
+const CONCURRENCY = 8;                  // prefetch pool size
 const PREFETCH_DEBOUNCE_MS = 150;       // debounce region/frame prefetch
 const MAX_FRAMES_TO_CACHE = 18;         // ~last 2h at ~6-10min cadence
-const ANIM_MS = 2500;                   // playback speed
-const ANIM_PINGPONG = false;            // forward/back loop
+const ANIM_MS = 2500;                   // playback speed (slower = bigger number)
 const WARM_START_THRESHOLD = 0.85;      // start playing once 85% of tiles cached
+
+/** ===== Bike rack config ===== */
+const NEARBY_RACK_RADIUS_M = 350; // show “nearby” racks within this distance of destination
+
+type BikeRack = {
+  id: number | string;
+  latitude: number;
+  longitude: number;
+  props: {
+    RackID?: string;
+    RackType?: string;
+    BikeCapacity?: number;
+    RackOwner?: string;
+    RackNotes?: string;
+    BRCondition?: string;
+    Cover?: number;
+  };
+};
 
 /** ===== Helpers ===== */
 function pad2(n: number) { return String(n).padStart(2, "0"); }
@@ -97,6 +114,16 @@ function tileUrl(ts: number, z: number, x: number, y: number, size = 256) {
   return `https://tilecache.rainviewer.com/v2/radar/${ts}/${size}/${z}/${x}/${y}/2/1_1.png`;
 }
 
+function haversineMeters(a: {latitude:number; longitude:number}, b:{latitude:number; longitude:number}) {
+  const R = 6371000;
+  const dLat = (b.latitude - a.latitude) * Math.PI/180;
+  const dLon = (b.longitude - a.longitude) * Math.PI/180;
+  const lat1 = a.latitude * Math.PI/180, lat2 = b.latitude * Math.PI/180;
+  const sinDLat = Math.sin(dLat/2), sinDLon = Math.sin(dLon/2);
+  const h = sinDLat*sinDLat + Math.cos(lat1)*Math.cos(lat2)*sinDLon*sinDLon;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
 /** ===== Simple tile cache + concurrency-limited prefetch queue ===== */
 const tileCache = new Set<string>();
 async function prefetchUrlOnce(url: string) {
@@ -112,10 +139,7 @@ async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency
   const workers = new Array(Math.min(concurrency, tasks.length)).fill(0).map(async () => {
     while (i < tasks.length) {
       const idx = i++;
-      results[idx] = tasks[idx]().finally(() => {
-        done += 1;
-        onProgress?.(done, total);
-      });
+      results[idx] = tasks[idx]().finally(() => { done += 1; onProgress?.(done, total); });
       await results[idx].catch(() => undefined);
     }
   });
@@ -149,7 +173,7 @@ export default function MapScreen() {
   // frames + indexing
   const [frames, setFrames] = useState<number[]>([]);
   const [frameIdx, setFrameIdx] = useState(0);
-  const [pendingIdx, setPendingIdx] = useState<number | null>(null); // for smooth slider UX
+  const [pendingIdx, setPendingIdx] = useState<number | null>(null);
 
   // timestamps
   const [activeTs, setActiveTs] = useState<number | undefined>(undefined);
@@ -168,6 +192,11 @@ export default function MapScreen() {
   const [warming, setWarming] = useState(false);
   const [warmProgress, setWarmProgress] = useState(0);
   const lastWarmSig = useRef<string | null>(null);
+
+  // bike racks
+  const [racks, setRacks] = useState<BikeRack[]>([]);
+  const [showRacks, setShowRacks] = useState(true);
+  const [nearbyRacks, setNearbyRacks] = useState<BikeRack[]>([]);
 
   // clock
   const [now, setNow] = useState<Date>(new Date());
@@ -370,7 +399,7 @@ export default function MapScreen() {
     setWarmProgress(1);
   }
 
-  // playback timer
+  // playback timer (always forward, loop at end)
   useEffect(() => {
     if (!isPlaying || windowFrames.length < 2) {
       if (animTimer.current) { clearInterval(animTimer.current); animTimer.current = null; }
@@ -381,14 +410,14 @@ export default function MapScreen() {
     animTimer.current = setInterval(() => {
       setFrameIdx(prev => {
         const last = windowFrames.length - 1;
-        return prev >= last ? 0 : prev + 1; // always forward, then wrap
+        return prev >= last ? 0 : prev + 1;
       });
     }, ANIM_MS);
 
     return () => {
       if (animTimer.current) { clearInterval(animTimer.current); animTimer.current = null; }
     };
-  }, [isPlaying, windowFrames.length, ANIM_MS]);
+  }, [isPlaying, windowFrames.length]);
 
   // labels
   const liveClock = `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
@@ -397,6 +426,85 @@ export default function MapScreen() {
   const selectedDate = shownTs ? new Date(shownTs * 1000) : null;
   const frameLabel = selectedDate ? selectedDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
   const deltaMin = selectedDate ? Math.round((selectedDate.getTime() - now.getTime()) / 60000) : 0;
+
+  /** ===== Bike racks fetch (robust JSON) ===== */
+  useEffect(() => {
+    let aborted = false;
+
+    async function fetchBikeRacksJSON() {
+      const BASE = "https://gis.ufl.edu/campusserver/rest/services/Bike_Rack_Locations/FeatureServer/0/query";
+      const params = new URLSearchParams({
+        where: "1=1",
+        outFields: "*",
+        f: "json",
+        outSR: "4326",
+        returnGeometry: "true",
+        resultOffset: "0",
+        resultRecordCount: "2000"
+      });
+
+      const all: BikeRack[] = [];
+      let offset = 0;
+
+      try {
+        while (true) {
+          params.set("resultOffset", String(offset));
+          const url = `${BASE}?${params.toString()}`;
+          const res = await fetch(url);
+          if (!res.ok) {
+            console.warn("Bike racks HTTP error", res.status, await res.text());
+            break;
+          }
+          const json = await res.json();
+          const feats = Array.isArray(json?.features) ? json.features : [];
+
+          for (const f of feats) {
+            const lon = f?.geometry?.x;
+            const lat = f?.geometry?.y;
+            if (Number.isFinite(lat) && Number.isFinite(lon)) {
+              all.push({
+                id: f?.attributes?.OBJECTID ?? `${lon},${lat}`,
+                latitude: lat,
+                longitude: lon,
+                props: {
+                  RackID: f?.attributes?.RackID,
+                  RackType: f?.attributes?.RackType,
+                  BikeCapacity: f?.attributes?.BikeCapacity,
+                  RackOwner: f?.attributes?.RackOwner,
+                  RackNotes: f?.attributes?.RackNotes,
+                  BRCondition: f?.attributes?.BRCondition,
+                  Cover: f?.attributes?.Cover,
+                },
+              });
+            }
+          }
+
+          if (feats.length < 2000) break; // last page
+          offset += 2000;
+          if (aborted) return;
+        }
+      } catch (e) {
+        console.warn("Bike racks fetch failed", e);
+      }
+
+      if (!aborted) {
+        console.log("Loaded bike racks:", all.length);
+        setRacks(all);
+      }
+    }
+
+    fetchBikeRacksJSON();
+    return () => { aborted = true; };
+  }, []);
+
+  // compute racks near destination
+  useEffect(() => {
+    if (!destination || !racks.length) { setNearbyRacks([]); return; }
+    const near = racks.filter(r =>
+      haversineMeters(destination, { latitude: r.latitude, longitude: r.longitude }) <= NEARBY_RACK_RADIUS_M
+    );
+    setNearbyRacks(near);
+  }, [destination?.latitude, destination?.longitude, racks]);
 
   if (loading || !destination) {
     return <View style={[styles.center, styles.container]}><Text>{loading ? "Locating…" : "Missing destination"}</Text></View>;
@@ -422,25 +530,15 @@ export default function MapScreen() {
   // handle pressing Play with warm-up gate
   const onPressPlay = async () => {
     if (!region || windowFrames.length < 2) return;
-
-    // if already warmed for this signature, play instantly
     const sig = warmSignature(region, windowFrames, TILE_SIZE);
     if (sig && sig === lastWarmSig.current) {
       setIsPlaying(p => !p);
       return;
     }
-
-    // otherwise warm first; auto-start when threshold is reached
     setIsPlaying(false);
     await warmPlaybackCache(region, windowFrames);
-
-    // remember signature to avoid re-warm
     lastWarmSig.current = sig;
-
-    // only start if we warmed sufficiently (defensive)
-    if (warmProgress >= WARM_START_THRESHOLD) {
-      setIsPlaying(true);
-    }
+    if (warmProgress >= WARM_START_THRESHOLD) setIsPlaying(true);
   };
 
   return (
@@ -458,11 +556,11 @@ export default function MapScreen() {
       >
         {radarEnabled && activeTs && (
           <UrlTile
-            key={`${activeTs}-${TILE_SIZE}-${Math.round(radarOpacity * 100)}`} // remount on frame OR opacity change
+            key={`${activeTs}-${TILE_SIZE}-${Math.round(radarOpacity * 100)}`}
             urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${TILE_SIZE}/{z}/{x}/{y}/2/1_1.png`}
             {...urlTileCommonProps}
             opacity={Platform.OS === "ios" ? radarOpacity : 1}
-            // @ts-ignore (prop exists on native side for Google provider on Android)
+            // @ts-ignore
             tileOverlayTransparency={Platform.OS === "android" ? androidTransparency : 0}
           />
         )}
@@ -470,6 +568,39 @@ export default function MapScreen() {
         {routeCoords.length > 0 && (
           <Polyline coordinates={routeCoords} strokeWidth={5} strokeColor="#007AFF" zIndex={20} />
         )}
+
+        {/* All racks (subtle) */}
+        {showRacks && racks.map(r => (
+          <Marker
+            key={`rack-${r.id}`}
+            coordinate={{ latitude: r.latitude, longitude: r.longitude }}
+            title={r.props.RackID || "Bike Rack"}
+            description={[
+              r.props.RackType ? `Type: ${r.props.RackType}` : "",
+              Number.isFinite(r.props.BikeCapacity) ? `Capacity: ${r.props.BikeCapacity}` : "",
+              r.props.RackOwner ? `Owner: ${r.props.RackOwner}` : "",
+              r.props.RackNotes ? r.props.RackNotes : "",
+            ].filter(Boolean).join("\n")}
+            pinColor="#6aa84f"
+            opacity={0.65}
+          />
+        ))}
+
+        {/* Nearby racks (highlight) */}
+        {showRacks && nearbyRacks.map(r => (
+          <Marker
+            key={`rack-near-${r.id}`}
+            coordinate={{ latitude: r.latitude, longitude: r.longitude }}
+            title={(r.props.RackID ? `${r.props.RackID} (nearby)` : "Bike Rack (nearby)")}
+            description={[
+              r.props.RackType ? `Type: ${r.props.RackType}` : "",
+              Number.isFinite(r.props.BikeCapacity) ? `Capacity: ${r.props.BikeCapacity}` : "",
+              r.props.RackNotes ? r.props.RackNotes : "",
+            ].filter(Boolean).join("\n")}
+            pinColor="#2e7d32"
+            opacity={1}
+          />
+        ))}
 
         <Marker
           coordinate={destination}
@@ -503,11 +634,38 @@ export default function MapScreen() {
                 {warming ? `Loading ${Math.round(warmProgress * 100)}%` : (isPlaying ? "Pause" : "Play")}
               </Text>
             </Pressable>
+
+            {/* Bike racks toggle */}
+            <Pressable
+              style={[styles.btn, showRacks ? styles.btnOn : styles.btnOff]}
+              onPress={() => setShowRacks(v => !v)}
+            >
+              <Text style={styles.btnText}>{showRacks ? "Bike Racks: ON" : "Bike Racks: OFF"}</Text>
+            </Pressable>
+
+            {/* Near racks zoom */}
+            <Pressable
+              style={[styles.btn, nearbyRacks.length ? styles.btnOn : styles.btnOff]}
+              onPress={() => {
+                if (!nearbyRacks.length || !mapRef.current) return;
+                const coords = nearbyRacks.map(r => ({ latitude: r.latitude, longitude: r.longitude }));
+                try {
+                  mapRef.current.fitToCoordinates(coords, {
+                    edgePadding: { top: 40, bottom: 40, left: 40, right: 40 },
+                    animated: true,
+                  });
+                } catch {}
+              }}
+            >
+              <Text style={styles.btnText}>
+                {nearbyRacks.length ? `Near Racks: ${nearbyRacks.length}` : "Near Racks: 0"}
+              </Text>
+            </Pressable>
           </View>
         </View>
       </View>
 
-      {/* Bottom slider (frame index) + times + loading */}
+      {/* Bottom slider (frame index) + times + loading) */}
       <View style={styles.bottomWrap}>
         <View style={styles.sliderWrap}>
           <Text style={styles.sliderLabel}>
@@ -521,7 +679,7 @@ export default function MapScreen() {
             onSlidingComplete={(n: number) => {
               const idx = Math.round(n);
               setPendingIdx(null);
-              setIsPlaying(false); // pause when user scrubs
+              setIsPlaying(false);
               setFrameIdx(idx);
             }}
             minimumValue={0}
