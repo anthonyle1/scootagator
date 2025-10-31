@@ -1,3 +1,4 @@
+// app/index.tsx
 import * as Location from "expo-location";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
@@ -30,7 +31,7 @@ export default function Index() {
   const [showAddRouteMenu, setShowAddRouteMenu] = useState(false);
   const [cardWidth, setCardWidth] = useState(0);
 
-  // Get current location
+  // ✅ Get current location
   useEffect(() => {
     (async () => {
       try {
@@ -50,7 +51,6 @@ export default function Index() {
     })();
   }, []);
 
-  // Handle place selection from SearchInput (main search bar)
   const handlePlaceSelected = async (place: { place_id: string; description: string }) => {
     if (!coords) return;
     try {
@@ -66,7 +66,7 @@ export default function Index() {
           { id: Date.now().toString(), name: place.description, lat: loc.lat, lng: loc.lng },
           ...prev.filter((r) => r.name !== place.description),
         ];
-        return updated.slice(0, 10); // cap at 10
+        return updated.slice(0, 10);
       });
 
       router.push({
@@ -85,7 +85,6 @@ export default function Index() {
     }
   };
 
-  // Handle tapping a saved or previous route
   const handleRoutePress = (item: RouteItem) => {
     if (item.id === "add") return setShowAddRouteMenu(true);
     if (!coords || item.lat === undefined || item.lng === undefined)
@@ -112,7 +111,6 @@ export default function Index() {
     });
   };
 
-  // Render each route item in the grid
   const renderRouteItem = ({ item }: { item: RouteItem }) => {
     const maxItemWidth = 100;
     const calculatedWidth = cardWidth
@@ -193,7 +191,6 @@ export default function Index() {
               </View>
             )}
 
-            {/* Saved Routes Header with Remove Button */}
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionTitle}>Saved routes:</Text>
               {customRoutes.length > 0 && (
@@ -297,28 +294,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(100, 149, 237, 0.2)",
   },
-  addRouteCard: {
-    backgroundColor: "#f5f5f5",
-    marginBottom: 15,
-  },
-  cancelButton: {
-    marginTop: 10,
-    alignSelf: "flex-end",
-  },
+  addRouteCard: { backgroundColor: "#f5f5f5", marginBottom: 15 },
+  cancelButton: { marginTop: 10, alignSelf: "flex-end" },
   removeRouteButton: {
     backgroundColor: "red",
     paddingVertical: 4,
     paddingHorizontal: 10,
     borderRadius: 8,
   },
-  removeRouteText: {
-    color: "white",
-    fontWeight: "600",
-    fontSize: 13,
-  },
-  previousRoutesList: {
-    maxHeight: 200,
-  },
+  removeRouteText: { color: "white", fontWeight: "600", fontSize: 13 },
+  previousRoutesList: { maxHeight: 200 },
   previousRouteItem: {
     backgroundColor: "#d0d0d0",
     borderRadius: 8,
@@ -326,9 +311,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     marginBottom: 10,
   },
-  previousRouteText: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#333",
-  },
+  previousRouteText: { fontSize: 14, fontWeight: "600", color: "#333" },
 });
