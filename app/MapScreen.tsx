@@ -23,7 +23,7 @@ import { useLocalSearchParams } from "expo-router";
 import * as Location from "expo-location";
 import Slider from "@react-native-community/slider";
 
-// Import local racks with busy metadata (GeoJSON)
+// Local racks with busy metadata (rename your file to .json and place it accordingly)
 import racksGeoJSON from "../assets/data/uf_bike_racks_with_busy.json";
 
 const GOOGLE_MAPS_APIKEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string;
@@ -42,12 +42,11 @@ type RackFeature = {
     RackNotes?: string | null;
     BRCondition?: string | null;
     Cover?: number | null;
-    // Busy metadata we added:
     busy?: {
       level: "LOW" | "MEDIUM" | "HIGH";
-      occupancy?: number | null; // 0..1 if you want a continuous value
-      updatedAt?: string | null; // ISO datetime string
-      confidence?: number | null; // 0..1
+      occupancy?: number | null;
+      updatedAt?: string | null;
+      confidence?: number | null;
     };
   };
   geometry: { type: "Point"; coordinates: [number, number] };
@@ -61,8 +60,8 @@ type BikeRack = {
 };
 
 /** ===== Tunables ===== */
-const MAX_NATIVE_Z = 12;                // RainViewer native max zoom
-const MAP_MAX_Z = 22;                   // allow deep zoom; tiles upscale
+const MAX_NATIVE_Z = 12;
+const MAP_MAX_Z = 22;
 const TILE_SIZE_IOS = 256;
 const TILE_SIZE_ANDROID = 512;
 const NEIGHBOR_RADIUS = 1;
@@ -87,7 +86,6 @@ function haversineMeters(a: {latitude:number; longitude:number}, b:{latitude:num
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-// decode polyline utility
 function decodePolyline(t: string): Coords[] {
   const out: Coords[] = [];
   let index = 0, lat = 0, lng = 0;
@@ -221,7 +219,7 @@ export default function MapScreen() {
   }, []);
 
   const [showRacks, setShowRacks] = useState(true);
-  const [filterNotBusy, setFilterNotBusy] = useState(false); // if true, hide medium/high
+  const [filterNotBusy, setFilterNotBusy] = useState(false);
   const [nearbyRacks, setNearbyRacks] = useState<BikeRack[]>([]);
 
   // clock (UI nicety)
@@ -261,6 +259,7 @@ export default function MapScreen() {
     routeFetchTimer.current = setTimeout(async () => {
       try {
         const pts = await computeRoute(o, d);
+        console.log("route points:", pts.length);
         setRouteCoords(pts);
         const initialRegion: Region = { latitude: o.latitude, longitude: o.longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 };
         if (pts.length && mapRef.current) {
@@ -269,7 +268,9 @@ export default function MapScreen() {
           mapRef.current.animateToRegion(initialRegion, 500);
         }
         setRegion((r) => r ?? initialRegion);
-      } catch {}
+      } catch (e) {
+        console.warn("computeRoute failed:", e);
+      }
     }, 600);
 
     return () => { if (routeFetchTimer.current) { clearTimeout(routeFetchTimer.current); routeFetchTimer.current = null; } };
@@ -488,19 +489,19 @@ export default function MapScreen() {
     longitudeDelta: 0.03,
   };
 
-  const androidTransparency = 0; // we removed opacity control
+  // Put radar UNDER everything & add Android transparency so route shows
   const urlTileCommonProps: any = {
     maximumNativeZ: MAX_NATIVE_Z,
     maximumZ: MAP_MAX_Z,
-    tileSize: TILE_SIZE,
-    zIndex: 999,
+    tileSize: Platform.OS === "ios" ? TILE_SIZE_IOS : TILE_SIZE_ANDROID,
+    zIndex: 0,
     shouldReplaceMapContent: false,
   };
 
   // handle pressing Play with warm-up gate
   const onPressPlay = async () => {
     if (!region || windowFrames.length < 2) return;
-    const sig = warmSignature(region, windowFrames, TILE_SIZE);
+    const sig = warmSignature(region, windowFrames, urlTileCommonProps.tileSize);
     if (sig && sig === lastWarmSig.current) {
       setIsPlaying(p => !p);
       return;
@@ -513,9 +514,9 @@ export default function MapScreen() {
 
   function pinColorForBusy(level?: "LOW" | "MEDIUM" | "HIGH") {
     switch (level) {
-      case "HIGH": return "#D32F2F";   // red
-      case "MEDIUM": return "#FB8C00"; // orange
-      default: return "#2E7D32";       // green (LOW / unknown)
+      case "HIGH": return "#D32F2F";
+      case "MEDIUM": return "#FB8C00";
+      default: return "#2E7D32";
     }
   }
 
@@ -542,16 +543,22 @@ export default function MapScreen() {
       >
         {radarEnabled && activeTs && (
           <UrlTile
-            key={`${activeTs}-${TILE_SIZE}`}
-            urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${TILE_SIZE}/{z}/{x}/{y}/2/1_1.png`}
+            key={`${activeTs}-${urlTileCommonProps.tileSize}`}
+            urlTemplate={`https://tilecache.rainviewer.com/v2/radar/${activeTs}/${urlTileCommonProps.tileSize}/{z}/{x}/{y}/2/1_1.png`}
             {...urlTileCommonProps}
-            // @ts-ignore (Android transparency prop)
-            tileOverlayTransparency={Platform.OS === "android" ? androidTransparency : 0}
+            // Android: 0=opaque, 1=fully transparent. Give it some transparency.
+            // @ts-ignore
+            tileOverlayTransparency={Platform.OS === "android" ? 0.45 : 0}
           />
         )}
 
         {routeCoords.length > 0 && (
-          <Polyline coordinates={routeCoords} strokeWidth={5} strokeColor="#007AFF" zIndex={20} />
+          <Polyline
+            coordinates={routeCoords}
+            strokeWidth={6}
+            strokeColor="#007AFF"
+            zIndex={1000} // ensure above tiles
+          />
         )}
 
         {visibleRacks.map(r => (
@@ -590,28 +597,27 @@ export default function MapScreen() {
         />
       </MapView>
 
-      {/* Compact Top Controls: always fits via horizontal scroll */}
+      {/* Debug banner if no route returned by Routes API */}
+      {routeCoords.length === 0 && (
+        <View style={styles.debugBanner}>
+          <Text style={styles.debugBannerText}>
+            No route polyline. Verify Google **Routes API** is enabled & billing is active.
+          </Text>
+        </View>
+      )}
+
+      {/* Compact Top Controls: fits via horizontal scroll */}
       <View style={styles.topWrap}>
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.controls}
-        >
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.controls}>
           <Pressable style={[styles.btn, radarEnabled ? styles.btnOn : styles.btnOff]} onPress={() => setRadarEnabled(v => !v)}>
             <Text style={styles.btnText}>{radarEnabled ? "Radar: ON" : "Radar: OFF"}</Text>
           </Pressable>
 
-          <Pressable
-            style={[styles.btn, showRacks ? styles.btnOn : styles.btnOff]}
-            onPress={() => setShowRacks(v => !v)}
-          >
+          <Pressable style={[styles.btn, showRacks ? styles.btnOn : styles.btnOff]} onPress={() => setShowRacks(v => !v)}>
             <Text style={styles.btnText}>{showRacks ? "Racks: ON" : "Racks: OFF"}</Text>
           </Pressable>
 
-          <Pressable
-            style={[styles.btn, filterNotBusy ? styles.btnOn : styles.btnOff]}
-            onPress={() => setFilterNotBusy(x => !x)}
-          >
+          <Pressable style={[styles.btn, filterNotBusy ? styles.btnOn : styles.btnOff]} onPress={() => setFilterNotBusy(x => !x)}>
             <Text style={styles.btnText}>{filterNotBusy ? "Only Not Busy" : "All Busy Levels"}</Text>
           </Pressable>
 
@@ -625,7 +631,6 @@ export default function MapScreen() {
             </Text>
           </Pressable>
 
-          {/* Zoom to racks near destination */}
           <Pressable
             style={[styles.btn, nearbyRacks.length ? styles.btnOn : styles.btnOff]}
             onPress={() => {
@@ -644,7 +649,7 @@ export default function MapScreen() {
             </Text>
           </Pressable>
 
-          {/* Busy legend (compact) */}
+          {/* Busy legend */}
           <View style={styles.legend}>
             <View style={[styles.dot, { backgroundColor: "#2E7D32" }]} />
             <Text style={styles.legendText}>Low</Text>
@@ -742,4 +747,15 @@ const styles = StyleSheet.create({
 
   loadingRow: { marginTop: 8, flexDirection: "row", alignItems: "center", justifyContent: "center" },
   loadingText: { marginLeft: 6, fontSize: 12, color: "#111", fontWeight: "600" },
+
+  debugBanner: {
+    position: "absolute",
+    top: 80,
+    left: 10,
+    right: 10,
+    backgroundColor: "#ffebee",
+    padding: 8,
+    borderRadius: 8,
+  },
+  debugBannerText: { color: "#b71c1c", fontWeight: "700" },
 });
